@@ -694,24 +694,38 @@ fn git_stdout(cwd: &std::path::Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-fn project_trust_cli(root: &std::path::Path, operation: &str, name: &str) -> Value {
+fn project_trust_cli(root: &std::path::Path, operation: &str, project: &std::path::Path) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_fut"))
         .env_clear()
         .env("HOME", root.join("home"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("PATH", "/usr/bin:/bin")
         .arg("--json")
-        .arg("project")
         .arg(operation)
-        .arg(name)
+        .arg(project)
         .output()
-        .expect("run daemonless project trust command");
+        .expect("run daemonless trust command");
     assert!(
         output.status.success(),
-        "project {operation} failed: {}",
+        "{operation} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse project trust JSON")
+    serde_json::from_slice(&output.stdout).expect("parse trust JSON")
+}
+
+fn project_trust_status_cli(
+    root: &std::path::Path,
+    project: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.join("home"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--json", "trust", "status"])
+        .arg(project)
+        .output()
+        .expect("run daemonless trust status command")
 }
 
 fn spawn_daemon(
@@ -8233,10 +8247,9 @@ panes = [
             format!("[projects.fut]\npath = {:?}\n", main),
         )
         .unwrap();
-        let trusted = project_trust_cli(root, "trust", "fut");
-        assert_eq!(trusted["command"], "project.trust");
+        let trusted = project_trust_cli(root, "trust", &main);
+        assert_eq!(trusted["command"], "trust");
         assert_eq!(trusted["version"], 1);
-        assert_eq!(trusted["result"]["name"], "fut");
         assert_eq!(trusted["result"]["trusted"], true);
         assert_eq!(trusted["result"]["changed"], true);
     })
@@ -8430,18 +8443,29 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
             &response,
             ServerMessage::Error { code, message }
                 if code == "untrusted_recipe"
-                    && message.contains("fut project trust unsafe")
+                    && message.contains("fut trust PATH")
         ),
         "unexpected untrusted response: {response:?}"
     );
     assert_eq!(without_observations(harness.resources().await), before);
     assert!(!project.join("untrusted-marker").exists());
 
-    let trusted = project_trust_cli(harness.root.path(), "trust", "unsafe");
-    assert_eq!(trusted["command"], "project.trust");
+    let status = project_trust_status_cli(harness.root.path(), &project);
+    assert_eq!(status.status.code(), Some(1));
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["command"], "trust.status");
+    assert_eq!(status["result"]["trusted"], false);
+    assert!(status["result"]["sha256"].is_string());
+
+    let trusted = project_trust_cli(harness.root.path(), "trust", &project);
+    assert_eq!(trusted["command"], "trust");
     assert_eq!(trusted["version"], 1);
     assert_eq!(trusted["result"]["trusted"], true);
     assert_eq!(trusted["result"]["changed"], true);
+    let status = project_trust_status_cli(harness.root.path(), &project);
+    assert_eq!(status.status.code(), Some(0));
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["result"]["trusted"], true);
     let store = harness.root.path().join("state/fut/trusted-recipes.toml");
     assert!(store.is_file());
     assert_eq!(
@@ -8491,7 +8515,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
     ));
     assert!(!project.join("changed-marker").exists());
 
-    let retrusted = project_trust_cli(harness.root.path(), "trust", "unsafe");
+    let retrusted = project_trust_cli(harness.root.path(), "trust", &project);
     assert_eq!(retrusted["result"]["changed"], true);
     let reopened = harness
         .control_command(ClientMessage::OpenLocation {
@@ -8513,8 +8537,8 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .close_session(SessionSelector::Id(second.session_id))
         .await;
 
-    let untrusted = project_trust_cli(harness.root.path(), "untrust", "unsafe");
-    assert_eq!(untrusted["command"], "project.untrust");
+    let untrusted = project_trust_cli(harness.root.path(), "untrust", &project);
+    assert_eq!(untrusted["command"], "untrust");
     assert_eq!(untrusted["version"], 1);
     assert_eq!(untrusted["result"]["trusted"], false);
     assert_eq!(untrusted["result"]["changed"], true);
@@ -8522,7 +8546,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
-            cwd: project,
+            cwd: project.clone(),
             program: None,
             argv: Vec::new(),
         })
@@ -8531,6 +8555,23 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         revoked,
         ServerMessage::Error { ref code, .. } if code == "untrusted_recipe"
     ));
+
+    fs::remove_file(project.join(".fut/project.toml")).unwrap();
+    let missing = project_trust_status_cli(harness.root.path(), &project);
+    assert_eq!(missing.status.code(), Some(1));
+    let missing: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["result"]["trusted"], false);
+    assert_eq!(missing["result"]["sha256"], Value::Null);
+
+    fs::write(
+        project.join(".fut/project.toml"),
+        "workspaces = 'invalid'\n",
+    )
+    .unwrap();
+    let malformed = project_trust_status_cli(harness.root.path(), &project);
+    assert_eq!(malformed.status.code(), Some(2));
+    let malformed: Value = serde_json::from_slice(&malformed.stderr).unwrap();
+    assert_eq!(malformed["error"]["code"], "command_failed");
     harness.shutdown().await;
 }
 

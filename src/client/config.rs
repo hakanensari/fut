@@ -1512,6 +1512,10 @@ pub(crate) struct ProjectConfig {
 }
 
 impl ProjectConfig {
+    pub(crate) fn repository(path: PathBuf) -> Self {
+        Self { path, recipe: None }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

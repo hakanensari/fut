@@ -48,6 +48,7 @@ pub(crate) struct WorkspaceRecipe {
     environment: BTreeMap<String, String>,
     #[serde(default)]
     focus: Option<String>,
+    #[serde(default)]
     workspaces: Vec<RecipeWorkspace>,
 }
 
@@ -115,32 +116,32 @@ pub(crate) struct RecipeTrustChange {
     pub inherently_trusted: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RecipeTrustStatus {
+    Trusted { source: PathBuf, digest: String },
+    Untrusted { source: PathBuf, digest: String },
+    Missing { source: PathBuf },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProjectDefinitionError {
     #[error(
         "untrusted project recipe {} (SHA-256 {digest}); {instruction}",
         path.display(),
-        instruction = trust_instruction(project.as_deref())
+        instruction = trust_instruction()
     )]
-    UntrustedRecipe {
-        project: Option<String>,
-        path: PathBuf,
-        digest: String,
-    },
+    UntrustedRecipe { path: PathBuf, digest: String },
     #[error(
-        "project {project:?} uses the explicitly configured recipe {}; it is inherently trusted and cannot be untrusted without removing `recipe` from global config",
+        "the explicitly configured recipe {} is inherently trusted and cannot be untrusted without removing `recipe` from global config",
         path.display()
     )]
-    InherentlyTrusted { project: String, path: PathBuf },
+    InherentlyTrusted { path: PathBuf },
     #[error(transparent)]
     Invalid(#[from] anyhow::Error),
 }
 
-fn trust_instruction(project: Option<&str>) -> String {
-    project.map_or_else(
-        || "approve it before opening a new workspace".into(),
-        |project| format!("run `fut project trust {project}` after reviewing it"),
-    )
+fn trust_instruction() -> &'static str {
+    "run `fut trust PATH` after reviewing it"
 }
 
 #[derive(Debug)]
@@ -226,6 +227,29 @@ impl TrustStoreLock {
 }
 
 impl WorkspaceRecipe {
+    fn add_default_workspace_if_empty(&mut self) {
+        if self.workspaces.is_empty() {
+            self.workspaces.push(RecipeWorkspace {
+                id: None,
+                title: None,
+                tabs: vec![RecipeTab {
+                    id: None,
+                    title: None,
+                    cwd: None,
+                    environment: BTreeMap::new(),
+                    panes: vec![RecipePane {
+                        id: None,
+                        command: None,
+                        exec: false,
+                        cwd: None,
+                        environment: BTreeMap::new(),
+                        split: None,
+                    }],
+                }],
+            });
+        }
+    }
+
     pub(crate) fn extension(&self) -> &BTreeMap<String, ExtensionConfigTable> {
         &self.extension
     }
@@ -319,15 +343,13 @@ impl RecipeSplit {
 /// global configuration boundary. A conventional repository recipe must match
 /// the current machine-local approval before its parsed commands are returned.
 pub(crate) fn load(
-    project_name: Option<&str>,
     project: &ProjectConfig,
     extensions: &[Extension],
 ) -> std::result::Result<Option<LoadedRecipe>, ProjectDefinitionError> {
-    load_with_trust_store(project_name, project, extensions, None)
+    load_with_trust_store(project, extensions, None)
 }
 
 fn load_with_trust_store(
-    project_name: Option<&str>,
     project: &ProjectConfig,
     extensions: &[Extension],
     state_path: Option<&Path>,
@@ -352,7 +374,6 @@ fn load_with_trust_store(
         let source = storable_path(&file.source)?;
         if !store.trusted(source, &file.digest) {
             return Err(ProjectDefinitionError::UntrustedRecipe {
-                project: project_name.map(str::to_owned),
                 path: file.source,
                 digest: file.digest,
             });
@@ -369,6 +390,32 @@ pub(crate) fn trust(
     extensions: &[Extension],
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
     trust_with_store(project, extensions, None, None)
+}
+
+/// Report whether the exact current bytes of a local repository recipe are
+/// valid and present in the machine-local trust store.
+pub(crate) fn trust_status(
+    project: &ProjectConfig,
+    extensions: &[Extension],
+) -> Result<RecipeTrustStatus> {
+    let source = repository_recipe_path(project);
+    let Some(file) = read_recipe(&source, false)? else {
+        return Ok(RecipeTrustStatus::Missing { source });
+    };
+    parse_recipe_ref(&file, extensions)?;
+    let store = read_trust_store(&trust_store_path()?)?;
+    let trusted = store.trusted(storable_path(&file.source)?, &file.digest);
+    if trusted {
+        Ok(RecipeTrustStatus::Trusted {
+            source: file.source,
+            digest: file.digest,
+        })
+    } else {
+        Ok(RecipeTrustStatus::Untrusted {
+            source: file.source,
+            digest: file.digest,
+        })
+    }
 }
 
 /// Validate and approve only the repository recipe whose digest was shown to
@@ -435,20 +482,17 @@ fn trust_with_store(
 /// Revoke the machine-local approval for a repository recipe. Explicit global
 /// recipe paths cannot be made untrusted through the local approval store.
 pub(crate) fn untrust(
-    project_name: &str,
     project: &ProjectConfig,
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
-    untrust_with_store(project_name, project, None)
+    untrust_with_store(project, None)
 }
 
 fn untrust_with_store(
-    project_name: &str,
     project: &ProjectConfig,
     state_path: Option<&Path>,
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
     if let Some(path) = project.recipe() {
         return Err(ProjectDefinitionError::InherentlyTrusted {
-            project: project_name.to_owned(),
             path: path.to_owned(),
         });
     }
@@ -531,8 +575,9 @@ fn parse_recipe(file: RecipeFile, extensions: &[Extension]) -> Result<LoadedReci
 fn parse_recipe_ref(file: &RecipeFile, extensions: &[Extension]) -> Result<WorkspaceRecipe> {
     let text = std::str::from_utf8(&file.bytes)
         .with_context(|| format!("project recipe {} is not UTF-8", file.source.display()))?;
-    let recipe = toml::from_str::<WorkspaceRecipe>(text)
+    let mut recipe = toml::from_str::<WorkspaceRecipe>(text)
         .with_context(|| format!("parse project recipe {}", file.source.display()))?;
+    recipe.add_default_workspace_if_empty();
     validate(&recipe, extensions)
         .with_context(|| format!("validate project recipe {}", file.source.display()))?;
     Ok(recipe)
@@ -1020,9 +1065,24 @@ mod tests {
     use super::*;
 
     fn parse(source: &str) -> Result<WorkspaceRecipe> {
-        let recipe = toml::from_str(source)?;
+        let mut recipe: WorkspaceRecipe = toml::from_str(source)?;
+        recipe.add_default_workspace_if_empty();
         validate(&recipe, &[])?;
         Ok(recipe)
+    }
+
+    #[test]
+    fn missing_or_empty_workspaces_use_one_default_shell() {
+        for source in [
+            "#:schema https://fut.sh/schemas/project.json\n",
+            "workspaces = []\n",
+        ] {
+            let recipe = parse(source).unwrap();
+            assert_eq!(recipe.workspaces().len(), 1);
+            assert_eq!(recipe.workspaces()[0].tabs().len(), 1);
+            assert_eq!(recipe.workspaces()[0].tabs()[0].panes().len(), 1);
+            assert_eq!(recipe.workspaces()[0].tabs()[0].panes()[0].command(), None);
+        }
     }
 
     #[test]
@@ -1150,15 +1210,14 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
         };
         let state_path = temporary.path().join("state/fut/trusted-recipes.toml");
 
-        let error =
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
+        let error = load_with_trust_store(&project, &[], Some(&state_path)).unwrap_err();
         assert!(matches!(
             error,
             ProjectDefinitionError::UntrustedRecipe { .. }
         ));
         let error = error.to_string();
         assert!(error.contains(&digest), "{error}");
-        assert!(error.contains("fut project trust fut"), "{error}");
+        assert!(error.contains("fut trust PATH"), "{error}");
 
         let trusted = trust_with_store(&project, &[], Some(&state_path), None).unwrap();
         assert!(trusted.changed);
@@ -1168,7 +1227,7 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
             fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let loaded = load_with_trust_store(Some("fut"), &project, &[], Some(&state_path))
+        let loaded = load_with_trust_store(&project, &[], Some(&state_path))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.digest, digest);
@@ -1180,7 +1239,7 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
         )
         .unwrap();
         assert!(matches!(
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
+            load_with_trust_store(&project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
         let changed_error =
@@ -1191,23 +1250,23 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
                 .contains("changed while awaiting approval")
         );
         assert!(matches!(
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
+            load_with_trust_store(&project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
         let retrusted = trust_with_store(&project, &[], Some(&state_path), None).unwrap();
         assert!(retrusted.changed);
         assert_ne!(retrusted.digest.as_deref(), Some(digest.as_str()));
         assert!(
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path))
+            load_with_trust_store(&project, &[], Some(&state_path))
                 .unwrap()
                 .is_some()
         );
 
-        let untrusted = untrust_with_store("fut", &project, Some(&state_path)).unwrap();
+        let untrusted = untrust_with_store(&project, Some(&state_path)).unwrap();
         assert!(untrusted.changed);
         assert!(!untrusted.trusted);
         assert!(matches!(
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
+            load_with_trust_store(&project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
     }
@@ -1225,13 +1284,13 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
             path: temporary.path().join("project"),
             recipe: Some(recipe_path),
         };
-        assert!(load(Some("fut"), &project, &[]).unwrap().is_some());
+        assert!(load(&project, &[]).unwrap().is_some());
         let trusted = trust(&project, &[]).unwrap();
         assert!(!trusted.changed);
         assert!(trusted.trusted);
         assert!(trusted.inherently_trusted);
         assert!(matches!(
-            untrust("fut", &project),
+            untrust(&project),
             Err(ProjectDefinitionError::InherentlyTrusted { .. })
         ));
     }
@@ -1255,39 +1314,39 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
         fs::write(&state_path, "version = 1\nunknown = true\n").unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let error =
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
+        let error = load_with_trust_store(&project, &[], Some(&state_path)).unwrap_err();
         assert!(matches!(error, ProjectDefinitionError::Invalid(_)));
         assert!(format!("{error:#}").contains("parse project recipe trust store"));
 
         fs::write(&state_path, "version = 1\nrecipes = []\n").unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644)).unwrap();
-        let error =
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
+        let error = load_with_trust_store(&project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("permissions 0600"));
 
         let oversized = fs::File::create(&state_path).unwrap();
         oversized.set_len(MAX_TRUST_STORE_BYTES + 1).unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let error =
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
+        let error = load_with_trust_store(&project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("maximum"));
 
         fs::remove_file(&state_path).unwrap();
         let target = temporary.path().join("state/other.toml");
         fs::write(&target, "version = 1\nrecipes = []\n").unwrap();
         std::os::unix::fs::symlink(&target, &state_path).unwrap();
-        let error =
-            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
+        let error = load_with_trust_store(&project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("read project recipe trust store"));
     }
 
     #[test]
-    fn invalid_recipe_is_not_approved() {
+    fn malformed_recipe_is_not_approved() {
         let temporary = tempfile::tempdir().unwrap();
         let project_root = temporary.path().join("project");
         fs::create_dir_all(project_root.join(".fut")).unwrap();
-        fs::write(project_root.join(".fut/project.toml"), "").unwrap();
+        fs::write(
+            project_root.join(".fut/project.toml"),
+            "workspaces = 'not a list'\n",
+        )
+        .unwrap();
         let project = ProjectConfig {
             path: project_root,
             recipe: None,

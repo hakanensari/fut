@@ -92,20 +92,14 @@ enum RecipeDestination {
     },
 }
 
-#[derive(Clone, Debug)]
-struct ConfiguredProject {
-    name: String,
-    config: global_config::ProjectConfig,
-}
-
 pub(super) async fn prepare_initial(
     catalog: &global_config::ProjectCatalog,
     extensions: &[crate::extensions::Extension],
     resolved: &ResolvedLocation,
     command_override: Option<(PathBuf, Vec<String>)>,
 ) -> Result<Option<PreparedRecipe>, DaemonError> {
-    let configured = configured_project(catalog, None, resolved).await?;
-    let Some(loaded) = load_project_recipe(configured.as_ref(), extensions)? else {
+    let project = recipe_project(catalog, None, resolved).await?;
+    let Some(loaded) = load_project_recipe(&project, extensions)? else {
         return Ok(None);
     };
     prepare_recipe(loaded, &resolved.workspace_root, command_override)
@@ -157,7 +151,7 @@ pub(super) async fn open_location(
         }
         state.projects.clone()
     };
-    let configured = configured_project(&catalog, project.as_deref(), &resolved).await?;
+    let recipe_project = recipe_project(&catalog, project.as_deref(), &resolved).await?;
     let extension_registry = {
         let state = shared.lock().await;
         Arc::clone(&state.extension_registry)
@@ -193,7 +187,7 @@ pub(super) async fn open_location(
         return open_location_without_recipe(shared, exited, name, resolved, program, argv).await;
     }
 
-    let loaded = match load_project_recipe(configured.as_ref(), extension_registry.extensions()) {
+    let loaded = match load_project_recipe(&recipe_project, extension_registry.extensions()) {
         Ok(loaded) => loaded,
         Err(error) => {
             let mut state = shared.lock().await;
@@ -279,11 +273,11 @@ pub(super) async fn open_location(
     Ok((selected, disposition))
 }
 
-async fn configured_project(
+async fn recipe_project(
     catalog: &global_config::ProjectCatalog,
     explicit_name: Option<&str>,
     resolved: &ResolvedLocation,
-) -> Result<Option<ConfiguredProject>, DaemonError> {
+) -> Result<global_config::ProjectConfig, DaemonError> {
     let resolver = ProjectResolver::default();
     if let Some(name) = explicit_name {
         let project = catalog.get(name).cloned().ok_or_else(|| {
@@ -315,10 +309,7 @@ async fn configured_project(
                 ),
             ));
         }
-        return Ok(Some(ConfiguredProject {
-            name: name.to_owned(),
-            config: project,
-        }));
+        return Ok(project);
     }
 
     let mut matched = None;
@@ -341,34 +332,28 @@ async fn configured_project(
                 ),
             ));
         }
-        matched = Some(ConfiguredProject {
-            name: name.to_owned(),
-            config: project.clone(),
-        });
+        matched = Some(project.clone());
     }
-    Ok(matched)
+    Ok(matched.unwrap_or_else(|| {
+        global_config::ProjectConfig::repository(resolved.workspace_root.clone())
+    }))
 }
 
 fn load_project_recipe(
-    project: Option<&ConfiguredProject>,
+    project: &global_config::ProjectConfig,
     extensions: &[crate::extensions::Extension],
 ) -> Result<Option<LoadedRecipe>, DaemonError> {
-    let Some(project) = project else {
-        return Ok(None);
-    };
-    crate::project_definition::load(Some(&project.name), &project.config, extensions).map_err(
-        |error| match error {
-            error @ ProjectDefinitionError::UntrustedRecipe { .. } => {
-                DaemonError::new("untrusted_recipe", error.to_string())
-            }
-            error @ ProjectDefinitionError::InherentlyTrusted { .. } => {
-                DaemonError::new("invalid_recipe", error.to_string())
-            }
-            ProjectDefinitionError::Invalid(error) => {
-                DaemonError::new("invalid_recipe", format!("{error:#}"))
-            }
-        },
-    )
+    crate::project_definition::load(project, extensions).map_err(|error| match error {
+        error @ ProjectDefinitionError::UntrustedRecipe { .. } => {
+            DaemonError::new("untrusted_recipe", error.to_string())
+        }
+        error @ ProjectDefinitionError::InherentlyTrusted { .. } => {
+            DaemonError::new("invalid_recipe", error.to_string())
+        }
+        ProjectDefinitionError::Invalid(error) => {
+            DaemonError::new("invalid_recipe", format!("{error:#}"))
+        }
+    })
 }
 
 pub(super) async fn reload_project_config(
@@ -392,8 +377,8 @@ pub(super) async fn reload_project_config(
             "the live session no longer matches its configured project",
         ));
     }
-    let configured = configured_project(&catalog, None, &resolved).await?;
-    let config = load_project_recipe(configured.as_ref(), extensions.extensions())?.and_then(
+    let recipe_project = recipe_project(&catalog, None, &resolved).await?;
+    let config = load_project_recipe(&recipe_project, extensions.extensions())?.and_then(
         |LoadedRecipe {
              source,
              digest,
@@ -854,6 +839,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn unconfigured_project_uses_its_workspace_root_for_local_recipes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let resolved = ProjectResolver::default()
+            .resolve(temporary.path())
+            .await
+            .unwrap();
+
+        let project = recipe_project(&global_config::ProjectCatalog::default(), None, &resolved)
+            .await
+            .unwrap();
+
+        assert_eq!(project.path(), resolved.workspace_root);
+        assert_eq!(project.recipe(), None);
+    }
+
+    #[tokio::test]
     async fn planning_uses_prepared_placements_and_builds_the_focused_topology() {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir(temporary.path().join("tab-cwd")).unwrap();
@@ -895,7 +896,7 @@ auto_start = true
         };
         let extension_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         let extensions = crate::extensions::load(&[extension_root]).unwrap();
-        let loaded = crate::project_definition::load(Some("test"), &project, &extensions)
+        let loaded = crate::project_definition::load(&project, &extensions)
             .unwrap()
             .unwrap();
         let recipe = prepare_recipe(loaded, temporary.path(), None)
@@ -982,7 +983,7 @@ panes = [{ command = ["pi"] }]
             path: temporary.path().to_owned(),
             recipe: Some(source),
         };
-        let loaded = crate::project_definition::load(Some("test"), &project, &[])
+        let loaded = crate::project_definition::load(&project, &[])
             .unwrap()
             .unwrap();
         let recipe = prepare_recipe(loaded, temporary.path(), None)

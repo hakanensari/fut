@@ -150,11 +150,26 @@ enum Command {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
-    /// Initialize, list, approve, or revoke project recipes.
+    /// Initialize or list projects.
     Project {
         /// Project operation to perform.
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Approve the exact current local project recipe after validating it.
+    Trust {
+        /// Project directory; defaults to the current directory.
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: Option<PathBuf>,
+        /// Inspect recipe trust without changing it.
+        #[command(subcommand)]
+        command: Option<TrustCommand>,
+    },
+    /// Revoke this machine's approval of a local project recipe.
+    Untrust {
+        /// Project directory; defaults to the current directory.
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: Option<PathBuf>,
     },
     /// Attach, rename, or close a session.
     Session {
@@ -241,17 +256,15 @@ enum ProjectCommand {
     /// List configured projects.
     #[command(alias = "ls")]
     List,
-    /// Approve the exact current repository recipe after validating it.
-    Trust {
-        /// Configured project name.
-        #[arg(add = ArgValueCompleter::new(completion::project))]
-        name: String,
-    },
-    /// Revoke this machine's approval of a repository recipe.
-    Untrust {
-        /// Configured project name.
-        #[arg(add = ArgValueCompleter::new(completion::project))]
-        name: String,
+}
+
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// Report whether the exact current local recipe is trusted.
+    Status {
+        /// Project directory; defaults to the current directory.
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -921,6 +934,28 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
     };
     let json_output = cli.json;
+    if let Some(Command::Trust {
+        command: Some(TrustCommand::Status { path }),
+        ..
+    }) = &cli.command
+        && !cli.ui_playground
+    {
+        let config_location = match cli.config_location() {
+            Ok(location) => location,
+            Err(error) => {
+                render_status_error(json_output, &error);
+                return ExitCode::from(2);
+            }
+        };
+        return match trust_status_command(path.clone(), &config_location, json_output).await {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => {
+                render_status_error(json_output, &error);
+                ExitCode::from(2)
+            }
+        };
+    }
     if matches!(cli.command, Some(Command::Doctor)) && !cli.ui_playground {
         let socket = match socket_path(cli.socket.as_deref()) {
             Ok(socket) => socket,
@@ -1047,6 +1082,17 @@ async fn execute(cli: Cli) -> Result<()> {
         }
     }
 
+    if let Some(Command::Trust {
+        path,
+        command: None,
+    }) = &cli.command
+    {
+        return trust_command(path.clone(), &cli.config_location()?, cli.json).await;
+    }
+    if let Some(Command::Untrust { path }) = &cli.command {
+        return untrust_command(path.clone(), cli.json).await;
+    }
+
     reject_interactive_json(&cli)?;
     let config_location = cli.config_location()?;
     let socket = socket_path(cli.socket.as_deref())?;
@@ -1054,11 +1100,14 @@ async fn execute(cli: Cli) -> Result<()> {
     match cli.command {
         None => {
             let current_dir = std::env::current_dir().context("read current directory")?;
-            let (cwd, configured_project) =
+            let (cwd, project_name, recipe_project) =
                 resolve_project_open(None, None, &current_dir, &config_location).await?;
-            if let Some((name, configured)) = configured_project.as_ref() {
-                confirm_project_recipe(name, configured, &config_location, cli.json)?;
-            }
+            confirm_project_recipe(
+                project_name.as_deref(),
+                &recipe_project,
+                &config_location,
+                cli.json,
+            )?;
             open_and_attach(&socket, cwd, &config_location).await
         }
         Some(Command::Attach) => client::attach_navigator(&socket, &config_location).await,
@@ -1070,12 +1119,15 @@ async fn execute(cli: Cli) -> Result<()> {
             command,
         }) => {
             let current_dir = std::env::current_dir()?;
-            let (cwd, configured_project) =
+            let (cwd, project_name, recipe_project) =
                 resolve_project_open(path, project.as_deref(), &current_dir, &config_location)
                     .await?;
-            if let Some((name, configured)) = configured_project.as_ref() {
-                confirm_project_recipe(name, configured, &config_location, cli.json)?;
-            }
+            confirm_project_recipe(
+                project_name.as_deref(),
+                &recipe_project,
+                &config_location,
+                cli.json,
+            )?;
             let (program, argv) = child_command(command);
             let ui = if background {
                 None
@@ -2049,6 +2101,13 @@ async fn execute(cli: Cli) -> Result<()> {
             command: WorkspaceCommand::Retire { workspace_id },
         }) => retire_workspace(&socket, cli.json, workspace_id).await,
         Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
+        Some(Command::Trust {
+            command: Some(TrustCommand::Status { .. }),
+            ..
+        }) => unreachable!("trust status is handled before command execution"),
+        Some(Command::Trust { command: None, .. }) | Some(Command::Untrust { .. }) => {
+            unreachable!("daemonless trust command was handled before daemon setup")
+        }
         Some(Command::Extension {
             command:
                 ExtensionCommand::Validate { .. }
@@ -2074,77 +2133,133 @@ fn run_project_command(
     json_output: bool,
     command: ProjectCommand,
 ) -> Result<()> {
-    if matches!(command, ProjectCommand::Init) {
-        return init_project(json_output);
-    }
-    let catalog = client::config::load_projects_location(config_location)?;
-    if matches!(command, ProjectCommand::List) {
-        let projects = catalog
-            .iter()
-            .map(|(name, project)| {
-                json!({
-                    "name": name,
-                    "path": project.path(),
-                    "recipe": project.recipe(),
+    match command {
+        ProjectCommand::Init => init_project(json_output),
+        ProjectCommand::List => {
+            let catalog = client::config::load_projects_location(config_location)?;
+            let projects = catalog
+                .iter()
+                .map(|(name, project)| {
+                    json!({
+                        "name": name,
+                        "path": project.path(),
+                        "recipe": project.recipe(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        let human = catalog
-            .iter()
-            .map(|(name, project)| format!("{name}\t{}", project.path().display()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return output(
-            json_output,
-            "project.list",
-            json!({ "projects": projects }),
-            human,
-        );
+                .collect::<Vec<_>>();
+            let human = catalog
+                .iter()
+                .map(|(name, project)| format!("{name}\t{}", project.path().display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            output(
+                json_output,
+                "project.list",
+                json!({ "projects": projects }),
+                human,
+            )
+        }
     }
+}
 
-    let (name, trust, command_name) = match command {
-        ProjectCommand::Trust { name } => (name, true, "project.trust"),
-        ProjectCommand::Untrust { name } => (name, false, "project.untrust"),
-        ProjectCommand::Init | ProjectCommand::List => {
-            unreachable!("daemonless project command returned above")
-        }
-    };
-    let project = catalog_project(&catalog, &name)?;
-    let change = if trust {
-        let loaded = client::config::load_extensions_location(config_location)?;
-        crate::project_definition::trust(project, &loaded.extensions)
-    } else {
-        crate::project_definition::untrust(&name, project)
-    }
-    .map_err(|error| match error {
-        error @ crate::project_definition::ProjectDefinitionError::InherentlyTrusted { .. } => {
-            anyhow::Error::new(CliError::new("inherently_trusted", error.to_string()))
-        }
-        error => anyhow::Error::new(error),
-    })?;
-    let trust_source = if change.inherently_trusted {
-        "global_config"
-    } else {
-        "machine_state"
-    };
+async fn trust_project(path: Option<PathBuf>) -> Result<client::config::ProjectConfig> {
+    let current_dir = std::env::current_dir().context("read current directory")?;
+    let path = resolve_open_path(path, &current_dir);
+    let resolved = crate::project::ProjectResolver::default()
+        .resolve(&path)
+        .await
+        .with_context(|| format!("resolve project path {}", path.display()))?;
+    Ok(client::config::ProjectConfig::repository(
+        resolved.workspace_root,
+    ))
+}
+
+async fn trust_command(
+    path: Option<PathBuf>,
+    config_location: &client::config::ConfigLocation,
+    json_output: bool,
+) -> Result<()> {
+    let project = trust_project(path).await?;
+    let loaded = client::config::load_extensions_location(config_location)?;
+    let change = crate::project_definition::trust(&project, &loaded.extensions)?;
     output(
         json_output,
-        command_name,
+        "trust",
         json!({
-            "name": name,
             "recipe": change.source,
             "sha256": change.digest,
             "trusted": change.trusted,
             "changed": change.changed,
-            "inherently_trusted": change.inherently_trusted,
         }),
         format!(
-            "project={name} trusted={} changed={} source={trust_source} recipe={}",
-            change.trusted,
-            change.changed,
-            change.source.display()
+            "trusted: {}{}",
+            change.source.display(),
+            if change.changed { "" } else { " (unchanged)" }
         ),
     )
+}
+
+async fn untrust_command(path: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let project = trust_project(path).await?;
+    let change = crate::project_definition::untrust(&project)?;
+    output(
+        json_output,
+        "untrust",
+        json!({
+            "recipe": change.source,
+            "sha256": change.digest,
+            "trusted": change.trusted,
+            "changed": change.changed,
+        }),
+        format!(
+            "untrusted: {}{}",
+            change.source.display(),
+            if change.changed { "" } else { " (unchanged)" }
+        ),
+    )
+}
+
+async fn trust_status_command(
+    path: Option<PathBuf>,
+    config_location: &client::config::ConfigLocation,
+    json_output: bool,
+) -> Result<bool> {
+    let project = trust_project(path).await?;
+    let loaded = client::config::load_extensions_location(config_location)?;
+    let status = crate::project_definition::trust_status(&project, &loaded.extensions)?;
+    let (trusted, source, digest, human) = match status {
+        crate::project_definition::RecipeTrustStatus::Trusted { source, digest } => {
+            let human = format!("trusted: {}", source.display());
+            (true, source, Some(digest), human)
+        }
+        crate::project_definition::RecipeTrustStatus::Untrusted { source, digest } => {
+            let human = format!("untrusted: {}", source.display());
+            (false, source, Some(digest), human)
+        }
+        crate::project_definition::RecipeTrustStatus::Missing { source } => {
+            let human = format!("no project recipe: {}", source.display());
+            (false, source, None, human)
+        }
+    };
+    output(
+        json_output,
+        "trust.status",
+        json!({
+            "trusted": trusted,
+            "recipe": source,
+            "sha256": digest,
+        }),
+        human,
+    )?;
+    Ok(trusted)
+}
+
+fn render_status_error(json_output: bool, error: &anyhow::Error) {
+    if json_output {
+        render_json_error("command_failed", format!("{error:#}"));
+    } else {
+        eprintln!("Error: {error:#}");
+    }
 }
 
 const PROJECT_RECIPE_TEMPLATE: &str = r#"#:schema https://fut.sh/schemas/project.json
@@ -2566,7 +2681,7 @@ async fn resolve_project_open(
     project: Option<&str>,
     current_dir: &std::path::Path,
     config_location: &client::config::ConfigLocation,
-) -> Result<(PathBuf, Option<(String, client::config::ProjectConfig)>)> {
+) -> Result<(PathBuf, Option<String>, client::config::ProjectConfig)> {
     let catalog = client::config::load_projects_location(config_location)?;
     if let Some(project_name) = project {
         let configured = catalog_project(&catalog, project_name)?.clone();
@@ -2574,7 +2689,7 @@ async fn resolve_project_open(
             || configured.path().to_owned(),
             |path| resolve_open_path(Some(path), current_dir),
         );
-        return Ok((cwd, Some((project_name.to_owned(), configured))));
+        return Ok((cwd, Some(project_name.to_owned()), configured));
     }
 
     let cwd = resolve_open_path(path, current_dir);
@@ -2599,7 +2714,16 @@ async fn resolve_project_open(
         }
         matched = Some((name.to_owned(), configured.clone()));
     }
-    Ok((cwd, matched))
+    let (name, recipe_project) = matched.map_or_else(
+        || {
+            (
+                None,
+                client::config::ProjectConfig::repository(requested.workspace_root),
+            )
+        },
+        |(name, configured)| (Some(name), configured),
+    );
+    Ok((cwd, name, recipe_project))
 }
 
 fn catalog_project<'a>(
@@ -2622,13 +2746,13 @@ fn catalog_project<'a>(
 }
 
 fn confirm_project_recipe(
-    name: &str,
+    name: Option<&str>,
     project: &client::config::ProjectConfig,
     config_location: &client::config::ConfigLocation,
     json_output: bool,
 ) -> Result<()> {
     let loaded = client::config::load_extensions_location(config_location)?;
-    let error = match crate::project_definition::load(Some(name), project, &loaded.extensions) {
+    let error = match crate::project_definition::load(project, &loaded.extensions) {
         Ok(_) => return Ok(()),
         Err(error) => error,
     };
@@ -2641,8 +2765,12 @@ fn confirm_project_recipe(
         return Err(error.into());
     }
 
+    let project_label = name.map_or_else(
+        || format!("Project at {}", project.path().display()),
+        |name| format!("Project {name:?}"),
+    );
     eprintln!(
-        "Project {name:?} contains an untrusted recipe:\n  {}\n  SHA-256 {digest}",
+        "{project_label} contains an untrusted recipe:\n  {}\n  SHA-256 {digest}",
         path.display()
     );
     let mut stdin = std::io::stdin().lock();
@@ -2665,7 +2793,13 @@ fn confirm_project_recipe(
     }
 
     crate::project_definition::trust_digest(project, &loaded.extensions, digest)?;
-    eprintln!("Trusted project recipe for {name:?}.");
+    match name {
+        Some(name) => eprintln!("Trusted project recipe for {name:?}."),
+        None => eprintln!(
+            "Trusted local project recipe at {}.",
+            project.path().display()
+        ),
+    }
     Ok(())
 }
 
@@ -5282,7 +5416,7 @@ mod tests {
     }
 
     #[test]
-    fn project_commands_parse_with_global_json() {
+    fn project_and_trust_commands_parse_with_global_json() {
         let init = Cli::try_parse_from(["fut", "project", "init"]).unwrap();
         assert!(matches!(
             init.command,
@@ -5301,22 +5435,27 @@ mod tests {
             ));
         }
 
-        let cli = Cli::try_parse_from(["fut", "--json", "project", "trust", "fut"]).unwrap();
+        let cli = Cli::try_parse_from(["fut", "--json", "trust", "."]).unwrap();
         assert!(cli.json);
         assert!(matches!(
             cli.command,
-            Some(Command::Project {
-                command: ProjectCommand::Trust { name }
-            }) if name == "fut"
+            Some(Command::Trust {
+                path: Some(path),
+                command: None,
+            }) if path == Path::new(".")
         ));
 
-        let cli = Cli::try_parse_from(["fut", "project", "untrust", "fut"]).unwrap();
+        let cli = Cli::try_parse_from(["fut", "trust", "status", "/tmp/project"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Project {
-                command: ProjectCommand::Untrust { name }
-            }) if name == "fut"
+            Some(Command::Trust {
+                path: None,
+                command: Some(TrustCommand::Status { path: Some(path) }),
+            }) if path == Path::new("/tmp/project")
         ));
+
+        let cli = Cli::try_parse_from(["fut", "untrust"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Untrust { path: None })));
     }
 
     #[tokio::test]
@@ -5352,6 +5491,26 @@ mod tests {
             .0,
             linked
         );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_project_still_supplies_a_local_recipe_candidate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("local");
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let config_location = client::config::resolve_location(Some(&config)).unwrap();
+
+        let (cwd, name, recipe_project) =
+            resolve_project_open(None, None, &project, &config_location)
+                .await
+                .unwrap();
+
+        assert_eq!(cwd, project);
+        assert_eq!(name, None);
+        assert_eq!(recipe_project.path(), project.canonicalize().unwrap());
+        assert_eq!(recipe_project.recipe(), None);
     }
 
     #[test]
@@ -5450,6 +5609,8 @@ mod tests {
                 "attach",
                 "open",
                 "project",
+                "trust",
+                "untrust",
                 "session",
                 "workspace",
                 "tab",
@@ -5480,7 +5641,17 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["init", "list", "trust", "untrust"]
+            ["init", "list"]
+        );
+
+        let command = cli_command();
+        let trust = command.find_subcommand("trust").unwrap();
+        assert_eq!(
+            trust
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect::<Vec<_>>(),
+            ["status"]
         );
 
         let command = cli_command();

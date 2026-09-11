@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Local project recipes are now discovered outside the global projects list, support path-based trust commands and scriptable trust status, and open one default shell when no layout is declared.
 - Trusted command programs in `config.toml` now support `~/` home-directory expansion.
 - Agent activity now clears when an integrated agent exits and another process takes over its terminal.
 

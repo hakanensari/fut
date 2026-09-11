@@ -35,7 +35,8 @@ pub(super) enum ProjectOpenerAction {
         request_id: Uuid,
     },
     Approve {
-        project: String,
+        project: Option<String>,
+        project_root: PathBuf,
         cwd: PathBuf,
         digest: String,
     },
@@ -54,7 +55,8 @@ enum Phase {
         request_id: Uuid,
     },
     Approval {
-        project: String,
+        project: Option<String>,
+        project_root: PathBuf,
         cwd: PathBuf,
         path: PathBuf,
         digest: String,
@@ -124,6 +126,7 @@ impl ProjectOpenerState {
             },
             Phase::Approval {
                 project,
+                project_root,
                 cwd,
                 digest,
                 recipe,
@@ -132,6 +135,7 @@ impl ProjectOpenerState {
             } => match key.code {
                 KeyCode::Char('y' | 'Y') => ProjectOpenerAction::Approve {
                     project: project.clone(),
+                    project_root: project_root.clone(),
                     cwd: cwd.clone(),
                     digest: digest.clone(),
                 },
@@ -238,7 +242,8 @@ impl ProjectOpenerState {
 
     pub(super) fn confirm_approval(
         &mut self,
-        project: String,
+        project: Option<String>,
+        project_root: PathBuf,
         cwd: PathBuf,
         path: PathBuf,
         digest: String,
@@ -247,6 +252,7 @@ impl ProjectOpenerState {
         self.error = None;
         self.phase = Phase::Approval {
             project,
+            project_root,
             cwd,
             path,
             digest,
@@ -346,7 +352,7 @@ impl ProjectOpenerState {
                 recipe,
                 scroll,
                 ..
-            } => render_approval(area, project, path, recipe, scroll, buffer),
+            } => render_approval(area, project.as_deref(), path, recipe, scroll, buffer),
             Phase::Preparing { .. } => {
                 fill_row(
                     Rect::new(area.x, area.y, area.width, 1),
@@ -566,7 +572,7 @@ impl ProjectOpenerState {
 
 fn render_approval(
     area: Rect,
-    project: &str,
+    project: Option<&str>,
     path: &Path,
     recipe: &[String],
     scroll: &mut usize,
@@ -580,7 +586,10 @@ fn render_approval(
     buffer.set_stringn(
         area.x,
         area.y,
-        format!(" Trust project recipe · {}", sanitize(project)),
+        project.map_or_else(
+            || " Trust local project recipe".to_owned(),
+            |project| format!(" Trust project recipe · {}", sanitize(project)),
+        ),
         usize::from(area.width),
         title_style(),
     );
@@ -703,7 +712,8 @@ mod tests {
         let mut opener =
             ProjectOpenerState::open(&catalog(temporary.path()), temporary.path().into());
         opener.confirm_approval(
-            "fut".into(),
+            Some("fut".into()),
+            temporary.path().join("fut"),
             temporary.path().join("fut"),
             recipe,
             "secret-digest".into(),
@@ -721,7 +731,8 @@ mod tests {
         assert_eq!(
             opener.key(key(KeyCode::Char('y')), 10),
             ProjectOpenerAction::Approve {
-                project: "fut".into(),
+                project: Some("fut".into()),
+                project_root: temporary.path().join("fut"),
                 cwd: temporary.path().join("fut"),
                 digest: "secret-digest".into(),
             }

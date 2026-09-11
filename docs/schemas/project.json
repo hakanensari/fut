@@ -26,14 +26,13 @@
     },
     "workspaces": {
       "type": "array",
-      "minItems": 1,
+      "description": "Initial workspace layout. When omitted or empty, Fut creates one workspace, tab, and shell pane.",
       "maxItems": 32,
       "items": {
         "$ref": "#/definitions/workspace"
       }
     }
   },
-  "required": ["workspaces"],
   "definitions": {
     "id": {
       "type": "string",

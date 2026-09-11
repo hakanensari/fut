@@ -58,23 +58,31 @@ approving or revoking one does not require a daemon restart.
 
 ## Trusted recipes
 
-Each catalog entry may initialize the declared workspaces of a newly created
-project session from a recipe. Once the project session is live, opening a
-linked checkout or creating another workspace starts one ordinary terminal; it
-does not recreate the recipe's workspaces, tabs, panes, or commands. Reopening a live
-workspace never rereads or reconciles its recipe and never reruns its commands.
-A linked Git worktree uses the recipe configured for the catalog root when it
-is the checkout that initially boots the project session, not a file from the
-linked checkout.
+Any project may initialize the declared workspaces of a newly created project
+session from a local recipe; it does not need to appear in the global catalog.
+Once the project session is live, opening a linked checkout or creating another
+workspace starts one ordinary terminal; it does not recreate the recipe's
+workspaces, tabs, panes, or commands. Reopening a live workspace never rereads
+or reconciles its recipe and never reruns its commands. A linked Git worktree
+uses the recipe configured for the catalog root when it is the checkout that
+initially boots the project session, not a file from the linked checkout.
 
-By default Fut looks for `.fut/project.toml` under the configured catalog root.
-Because that repository-owned file can run commands, review it and approve its
-exact current contents with:
+By default Fut looks for `.fut/project.toml` under the project's root. For a
+catalog entry, this is the configured catalog root. For an unconfigured path,
+it is the resolved Git worktree or directory root. Because that
+repository-owned file can run commands, Fut presents it for review when the
+project is opened and loads it only after you approve its exact contents. A
+catalog entry can also be approved explicitly with:
 
 ```sh
 fut project init
-fut project trust fut
+fut trust
+fut trust path/to/project
 ```
+
+The `workspaces` list is optional. When it is omitted or empty, Fut starts with
+one ordinary workspace, tab, and shell pane while still applying project-level
+environment and extension configuration.
 
 The in-client project opener performs the same approval safely without a shell:
 it displays the recipe contents, asks for `y` or `n`, and records approval
@@ -89,11 +97,16 @@ refuses to overwrite an existing `.fut/project.toml`.
 This command works without a running daemon. It resolves the configured
 project, reads a canonical regular recipe file, and fully validates the recipe
 before recording machine-local approval for its exact bytes. Changing any byte
-makes the recipe untrusted again. Run `fut project untrust fut` to revoke
-approval. The next attempt to bootstrap or reload the project session will fail
-before running recipe commands. Existing live layouts and processes are not
-reconciled on reload; only the extension configuration captured by the session
-is replaced.
+makes the recipe untrusted again. Run `fut untrust [PATH]` to revoke approval.
+Both commands default to the current project. The next attempt to bootstrap or
+reload the project session will fail before running recipe commands. Existing
+live layouts and processes are not reconciled on reload; only the extension
+configuration captured by the session is replaced.
+
+Use `fut trust status [PATH]` to inspect the current recipe without changing
+trust. It exits 0 when trusted, 1 when untrusted or absent, and 2 when status
+cannot be determined, making it suitable for shell conditionals. Add `--json`
+for structured `trusted`, `recipe`, and `sha256` fields.
 
 Approval state is managed exclusively by Fut under
 `$XDG_STATE_HOME/fut/trusted-recipes.toml`, falling back to
@@ -101,10 +114,9 @@ Approval state is managed exclusively by Fut under
 unsafe state file causes repository recipes to fail closed.
 
 Alternatively, set `recipe` to an absolute or `~/` path in global config. That
-explicit path is inherently trusted. `fut project trust NAME` reports a
-validated no-op for it, while `fut project untrust NAME` explains that the
-global `recipe` setting must be removed to revoke trust. Recipe files must be
-regular UTF-8 files no larger than 64 KiB.
+explicit path is inherently trusted; remove the global `recipe` setting to
+revoke that trust. Recipe files must be regular UTF-8 files no larger than 64
+KiB.
 
 ## Recipe format
 

@@ -945,13 +945,14 @@ async fn run_loop(
                     }
                     Ok(ProjectOpenPreparation::Approval {
                         project,
+                        project_root,
                         cwd,
                         path,
                         digest,
                         source,
                     }) => {
                         project_opener_mut(&mut surface)
-                            .confirm_approval(project, cwd, path, digest, &source);
+                            .confirm_approval(project, project_root, cwd, path, digest, &source);
                     }
                     Err(error) => {
                         project_opener_mut(&mut surface).show_error(one_line_error(&error));
@@ -2020,16 +2021,20 @@ async fn run_loop(
                                     project_preparation = None;
                                 }
                             }
-                            ProjectOpenerAction::Approve { project, cwd, digest } => {
+                            ProjectOpenerAction::Approve {
+                                project,
+                                project_root,
+                                cwd,
+                                digest,
+                            } => {
                                 match approve_project_recipe(
-                                    &project,
+                                    &project_root,
                                     &digest,
-                                    config_location,
                                     &ui.extensions,
                                 ) {
                                     Ok(_) => {
                                         let opener = project_opener_mut(&mut surface);
-                                        request_project_open(framed, opener, Some(project), cwd).await?;
+                                        request_project_open(framed, opener, project, cwd).await?;
                                     }
                                     Err(error) => {
                                         project_opener_mut(&mut surface).show_error(format!(
@@ -4175,7 +4180,8 @@ enum ProjectOpenPreparation {
         cwd: PathBuf,
     },
     Approval {
-        project: String,
+        project: Option<String>,
+        project_root: PathBuf,
         cwd: PathBuf,
         path: PathBuf,
         digest: String,
@@ -4196,8 +4202,14 @@ async fn prepare_project_open(
     extensions: &[crate::extensions::Extension],
 ) -> anyhow::Result<ProjectOpenPreparation> {
     let catalog = config::load_projects_location(config_location)?;
-    let (project, cwd) = match choice {
-        ProjectOpenChoice::Configured { name, path } => (Some(name), path),
+    let (project, cwd, recipe_project) = match choice {
+        ProjectOpenChoice::Configured { name, path } => {
+            let configured = catalog
+                .get(&name)
+                .with_context(|| format!("configured project {name:?} is unavailable"))?
+                .clone();
+            (Some(name), path, configured)
+        }
         ProjectOpenChoice::Path(path) => {
             let resolver = crate::project::ProjectResolver::default();
             let requested = resolver
@@ -4220,20 +4232,20 @@ async fn prepare_project_open(
                 }
                 matched = Some(name.to_owned());
             }
-            (matched, path)
+            let recipe_project = matched.as_ref().map_or_else(
+                || config::ProjectConfig::repository(requested.workspace_root),
+                |name| {
+                    catalog
+                        .get(name)
+                        .expect("matched project came from this catalog")
+                        .clone()
+                },
+            );
+            (matched, path, recipe_project)
         }
     };
-    let Some(name) = project else {
-        return Ok(ProjectOpenPreparation::Ready { project: None, cwd });
-    };
-    let configured = catalog
-        .get(&name)
-        .with_context(|| format!("configured project {name:?} is unavailable"))?;
-    match crate::project_definition::load(Some(&name), configured, extensions) {
-        Ok(_) => Ok(ProjectOpenPreparation::Ready {
-            project: Some(name),
-            cwd,
-        }),
+    match crate::project_definition::load(&recipe_project, extensions) {
+        Ok(_) => Ok(ProjectOpenPreparation::Ready { project, cwd }),
         Err(crate::project_definition::ProjectDefinitionError::UntrustedRecipe {
             path,
             digest,
@@ -4246,7 +4258,8 @@ async fn prepare_project_open(
                 bail!("project recipe changed while preparing review; retry opening it");
             }
             Ok(ProjectOpenPreparation::Approval {
-                project: name,
+                project,
+                project_root: recipe_project.path().to_owned(),
                 cwd,
                 path,
                 digest,
@@ -4258,16 +4271,12 @@ async fn prepare_project_open(
 }
 
 fn approve_project_recipe(
-    project: &str,
+    project_root: &Path,
     digest: &str,
-    config_location: &config::ConfigLocation,
     extensions: &[crate::extensions::Extension],
 ) -> anyhow::Result<()> {
-    let catalog = config::load_projects_location(config_location)?;
-    let configured = catalog
-        .get(project)
-        .with_context(|| format!("configured project {project:?} is unavailable"))?;
-    crate::project_definition::trust_digest(configured, extensions, digest)?;
+    let project = config::ProjectConfig::repository(project_root.to_owned());
+    crate::project_definition::trust_digest(&project, extensions, digest)?;
     Ok(())
 }
 

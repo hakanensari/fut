@@ -96,7 +96,7 @@ The portion of a project definition applied when a workspace is first created. I
 
 ### Project trust
 
-The user's machine-local approval for the exact current bytes at a repository recipe's canonical path. `fut project trust NAME` validates and approves that recipe, while `fut project untrust NAME` revokes it; neither operation requires a daemon. Changed content is untrusted, and reading safe metadata does not imply permission to run project-provided commands, hooks, or plugins. A recipe path explicitly selected in global configuration is inherently trusted.
+The user's machine-local approval for the exact current bytes at a repository recipe's canonical path. `fut trust [PATH]` validates and approves that recipe, while `fut untrust [PATH]` revokes it; neither operation requires a daemon. `fut trust status [PATH]` reports whether the current bytes are approved. Changed content is untrusted, and reading safe metadata does not imply permission to run project-provided commands, hooks, or plugins. A recipe path explicitly selected in global configuration is inherently trusted.
 
 ### Activity
 
