@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use ratatui::{
     buffer::Buffer,
@@ -19,6 +19,19 @@ const INFO_LIFETIME: Duration = Duration::from_secs(3);
 const MAX_WIDTH: u16 = 64;
 const HORIZONTAL_MARGIN: u16 = 2;
 const VERTICAL_MARGIN: u16 = 1;
+const MAX_MESSAGES: usize = 200;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MessageKind {
+    Info,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Message {
+    pub kind: MessageKind,
+    pub text: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Toast {
@@ -44,6 +57,7 @@ impl Toast {
 #[derive(Default)]
 pub(super) struct ToastState {
     current: Option<ActiveToast>,
+    messages: VecDeque<Message>,
 }
 
 struct ActiveToast {
@@ -53,6 +67,12 @@ struct ActiveToast {
 
 impl ToastState {
     pub(super) fn replace(&mut self, toast: Option<Toast>) {
+        if let Some(message) = toast.as_ref().and_then(Message::from_toast) {
+            if self.messages.len() == MAX_MESSAGES {
+                self.messages.pop_front();
+            }
+            self.messages.push_back(message);
+        }
         self.current = toast.map(|toast| {
             let expires_at =
                 matches!(toast, Toast::Info(_)).then(|| Instant::now() + INFO_LIFETIME);
@@ -74,6 +94,32 @@ impl ToastState {
 
     pub(super) fn is_visible(&self) -> bool {
         self.current.is_some()
+    }
+
+    pub(super) fn messages(&self) -> impl ExactSizeIterator<Item = &Message> {
+        self.messages.iter()
+    }
+
+    pub(super) fn clear_messages(&mut self) {
+        self.messages.clear();
+    }
+
+    pub(super) fn hit_test(
+        &self,
+        host: Rect,
+        tab_bar_position: TabBarPosition,
+        column: u16,
+        row: u16,
+    ) -> bool {
+        let Some(active) = self.current.as_ref() else {
+            return false;
+        };
+        let message = match &active.toast {
+            Toast::Info(message) | Toast::Error(message) => message,
+            Toast::Prompt(_) => return false,
+        };
+        let area = toast_area(host, tab_bar_position, &sanitize(message));
+        column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
@@ -130,6 +176,22 @@ impl ToastState {
             usize::from(text_width),
             style,
         );
+    }
+}
+
+impl Message {
+    fn from_toast(toast: &Toast) -> Option<Self> {
+        match toast {
+            Toast::Info(text) => Some(Self {
+                kind: MessageKind::Info,
+                text: text.clone(),
+            }),
+            Toast::Error(text) => Some(Self {
+                kind: MessageKind::Error,
+                text: text.clone(),
+            }),
+            Toast::Prompt(_) => None,
+        }
     }
 }
 
@@ -208,6 +270,47 @@ mod tests {
         assert_eq!(state.deadline(), None);
         state.expire();
         assert!(state.is_visible());
+    }
+
+    #[test]
+    fn keeps_a_bounded_log_without_recording_prompts() {
+        let mut state = ToastState::default();
+        state.info("done");
+        state.replace(Some(Toast::prompt("Close pane? (y/n)")));
+        state.error("failed");
+
+        assert_eq!(
+            state.messages().cloned().collect::<Vec<_>>(),
+            [
+                Message {
+                    kind: MessageKind::Info,
+                    text: "done".into(),
+                },
+                Message {
+                    kind: MessageKind::Error,
+                    text: "failed".into(),
+                },
+            ]
+        );
+
+        for index in 0..MAX_MESSAGES {
+            state.info(index.to_string());
+        }
+        assert_eq!(state.messages().len(), MAX_MESSAGES);
+        assert_eq!(state.messages().next().unwrap().text, "0");
+    }
+
+    #[test]
+    fn only_visible_message_toasts_are_clickable() {
+        let host = Rect::new(0, 0, 80, 24);
+        let mut state = ToastState::default();
+        state.info("a long message");
+        let area = toast_area(host, TabBarPosition::Top, "a long message");
+        assert!(state.hit_test(host, TabBarPosition::Top, area.x + 1, area.y + 1));
+        assert!(!state.hit_test(host, TabBarPosition::Top, 0, 0));
+
+        state.replace(Some(Toast::prompt("continue?")));
+        assert!(!state.hit_test(host, TabBarPosition::Top, area.x + 1, area.y + 1));
     }
 
     #[test]

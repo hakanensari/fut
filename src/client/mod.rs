@@ -16,6 +16,7 @@ mod graphics;
 mod hotkey;
 pub(crate) mod input;
 mod layout;
+mod messages;
 mod navigation;
 mod navigator;
 mod notifications;
@@ -83,6 +84,7 @@ use layout::{
     PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
     navigation_pane_layouts, pane_layouts,
 };
+use messages::{MessagesAction, MessagesDialog};
 use navigation::NavigationHistory;
 use navigator::{NavigatorAction, NavigatorState};
 use notifications::{
@@ -142,6 +144,7 @@ enum ClientSurface {
     ProjectOpener(ProjectOpenerState),
     Agents(AgentsDialog),
     Notifications(NotificationsDialog),
+    Messages(MessagesDialog),
     Sidebar(SidebarState),
     TabBar(TabBarState),
     CommandBar(CommandBarState),
@@ -1747,6 +1750,25 @@ async fn run_loop(
                     }
                     CloseConfirmationInput::Consume => continue,
                 }
+                if let Event::Mouse(mouse) = event
+                    && temporary_command.is_none()
+                    && copy_mode.is_none()
+                    && rename.is_none()
+                    && matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left))
+                    && toasts.hit_test(
+                        terminal.size()?.into(),
+                        ui.tab_bar.position,
+                        mouse.column,
+                        mouse.row,
+                    )
+                {
+                    mouse_input.discard(mouse);
+                    surface = Some(ClientSurface::Messages(MessagesDialog::open()));
+                    toasts.clear();
+                    view.invalidate_drawn();
+                    force_draw = true;
+                    continue;
+                }
                 match event {
                     Event::Key(key) if temporary_command.is_some() => {
                         let command = temporary_command.as_mut().expect("command exists");
@@ -2094,6 +2116,30 @@ async fn run_loop(
                             }
                         }
                     }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Messages(_))) => {
+                        toasts.clear();
+                        let host = terminal.size()?.into();
+                        let action = match surface.as_mut().expect("messages exist") {
+                            ClientSurface::Messages(dialog) => {
+                                dialog.key(key, host, toasts.messages())
+                            }
+                            _ => unreachable!("surface guard ensures messages"),
+                        };
+                        match action {
+                            MessagesAction::Stay => {}
+                            MessagesAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                            }
+                            MessagesAction::Clear => {
+                                toasts.clear_messages();
+                                if let Some(ClientSurface::Messages(dialog)) = surface.as_mut() {
+                                    dialog.reset();
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         toasts.clear();
                         let size = terminal.size()?;
@@ -2383,7 +2429,7 @@ async fn run_loop(
                                 ).await?;
                                 surface = None;
                                 view.invalidate_drawn();
-                                toasts.replace(dispatch_client_action(
+                                let toast = dispatch_client_action(
                                     action,
                                     framed,
                                     &mut view,
@@ -2404,7 +2450,8 @@ async fn run_loop(
                                     &mut extension_reload,
                                     &mut project_config_reload,
                                     true,
-                                ).await?);
+                                ).await?;
+                                toasts.replace(toast);
                                 force_draw = true;
                             }
                         }
@@ -2958,7 +3005,7 @@ async fn run_loop(
                                         terminal_id: view.focused().terminal_id,
                                     },
                                 ).await?;
-                                toasts.replace(dispatch_client_action(
+                                let toast = dispatch_client_action(
                                     action,
                                     framed,
                                     &mut view,
@@ -2979,7 +3026,8 @@ async fn run_loop(
                                     &mut extension_reload,
                                     &mut project_config_reload,
                                     focused_terminal_was_covered,
-                                ).await?);
+                                ).await?;
+                                toasts.replace(toast);
                                 force_draw = true;
                             }
                             PrefixAction::Send(bytes) => {
@@ -3237,6 +3285,14 @@ async fn run_loop(
                             Some(ClientSurface::Notifications(dialog)) => {
                                 dialog.render(area, frame.buffer_mut());
                             }
+                            Some(ClientSurface::Messages(dialog)) => {
+                                dialog.render(
+                                    area,
+                                    &ui.styles,
+                                    toasts.messages(),
+                                    frame.buffer_mut(),
+                                );
+                            }
                             Some(ClientSurface::CommandBar(command_bar)) => {
                                 command_bar.render(layout.terminal, frame.buffer_mut());
                             }
@@ -3480,7 +3536,8 @@ fn refresh_surface_resources(
             dialog.accept_resources(snapshot, notifications);
         }
         Some(
-            ClientSurface::CommandBar(_)
+            ClientSurface::Messages(_)
+            | ClientSurface::CommandBar(_)
             | ClientSurface::ProjectOpener(_)
             | ClientSurface::ContextMenu(_)
             | ClientSurface::CommandForm(_),
@@ -4602,6 +4659,9 @@ async fn dispatch_client_action(
             *surface = Some(ClientSurface::CommandBar(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
+        }
+        ClientAction::OpenMessages => {
+            *surface = Some(ClientSurface::Messages(MessagesDialog::open()));
         }
         ClientAction::OpenProject => {
             let catalog = match config::load_projects_location(config_location) {

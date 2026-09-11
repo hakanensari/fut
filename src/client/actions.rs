@@ -85,6 +85,7 @@ impl NavigationScope {
 pub(super) enum ClientAction {
     RunCommand(usize),
     OpenCommandBar,
+    OpenMessages,
     OpenProject,
     ReloadConfig,
     ReloadProjectConfig,
@@ -133,8 +134,9 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 49] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 50] = [
     ClientAction::OpenCommandBar,
+    ClientAction::OpenMessages,
     ClientAction::OpenProject,
     ClientAction::ReloadConfig,
     ClientAction::ReloadProjectConfig,
@@ -185,7 +187,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 49] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 48] = [
+pub(super) const COMMANDS: [ActionDefinition; 49] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -230,6 +232,11 @@ pub(super) const COMMANDS: [ActionDefinition; 48] = [
         action: ClientAction::OpenNotifications,
         title: "Open alerts and notifications",
         keywords: "alerts bell notifications unread waiting agents completed blocked",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenMessages,
+        title: "Show messages",
+        keywords: "messages log logs notices notifications toast errors history",
     },
     ActionDefinition {
         action: ClientAction::FocusNextNotification,
@@ -431,10 +438,14 @@ pub(super) const COMMANDS: [ActionDefinition; 48] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 42] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 43] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
+    },
+    DirectBinding {
+        suffix: b"m",
+        action: ClientAction::OpenMessages,
     },
     DirectBinding {
         suffix: b"S",
@@ -615,6 +626,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
     match action {
         ClientAction::RunCommand(_) => "run-command",
         ClientAction::OpenCommandBar => "command-palette",
+        ClientAction::OpenMessages => "show-messages",
         ClientAction::OpenProject => "open-project",
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::ReloadProjectConfig => "reload-project-config",
@@ -670,6 +682,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
     match action {
         ClientAction::RunCommand(_) => panic!("configured commands do not have built-in keys"),
         ClientAction::OpenCommandBar => "open_command_bar",
+        ClientAction::OpenMessages => "open_messages",
         ClientAction::OpenProject => "open_project",
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::ReloadProjectConfig => "reload_project_config",
@@ -770,7 +783,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
     match action {
         ClientAction::RunCommand(_) => true,
         ClientAction::OpenCommandBar => false,
-        ClientAction::OpenProject
+        ClientAction::OpenMessages
+        | ClientAction::OpenProject
         | ClientAction::ReloadConfig
         | ClientAction::ReloadProjectConfig
         | ClientAction::EnterCopyMode
@@ -884,6 +898,7 @@ mod tests {
         );
         assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
         assert_eq!(bindings.label(ClientAction::OpenProject), "Ctrl-b S");
+        assert_eq!(bindings.label(ClientAction::OpenMessages), "Ctrl-b m");
         assert_eq!(bindings.label(ClientAction::OpenLeftSidebar), "Ctrl-b w");
         assert_eq!(bindings.label(ClientAction::OpenRightSidebar), "Ctrl-b ]");
         assert_eq!(bindings.label(ClientAction::RenameSession), "Unbound");
@@ -907,6 +922,7 @@ mod tests {
         let names = ALL_ACTIONS.map(command_name);
         assert_eq!(names.into_iter().collect::<HashSet<_>>().len(), names.len());
         assert_eq!(command_name(ClientAction::CreateTab), "new-tab");
+        assert_eq!(command_name(ClientAction::OpenMessages), "show-messages");
         assert_eq!(
             command_name(ClientAction::FocusPane(FocusDirection::Left)),
             "select-pane -L"

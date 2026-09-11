@@ -60,6 +60,7 @@ The configuration name is the key to override under `[ui.bindings]`.
 | Key | Action | Configuration name |
 | --- | --- | --- |
 | `:` | Search every command and configured extension action | `open_command_bar` |
+| `m` | Show messages from the current client session | `open_messages` |
 | `Shift-S` | Open a configured project or path | `open_project` |
 | `R` | Reload global and focused-project configuration | `reload_config` |
 | `[` | Enter copy mode | `enter_copy_mode` |
@@ -111,7 +112,8 @@ The tab bar and workspace rows also support the mouse: left-click to switch or
 activate a clickable extension token, and right-click for create, rename,
 close, and sidebar display actions. Token clicks include their visible affixes
 and pills and take precedence over switching the surrounding tab or expanded
-workspace row. Drag pane or sidebar dividers to resize them. Fut preserves
+workspace row. Click a toast to open the complete message log for the current
+client session. Drag pane or sidebar dividers to resize them. Fut preserves
 application mouse reporting; when an application does not claim the mouse, the
 wheel scrolls client-local history and dragging selects text. Hold Shift to
 force Fut selection.
