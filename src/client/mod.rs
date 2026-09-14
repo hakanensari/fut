@@ -1827,6 +1827,7 @@ async fn run_loop(
                                 let submission = form.submit();
                                 let host: Rect = terminal.size()?.into();
                                 match spawn_temporary_command(
+                                    ui.terminal,
                                     &submission.command,
                                     view.focused().child_pid,
                                     host,
@@ -4510,6 +4511,7 @@ async fn dispatch_presentation_token_action(
                 return Ok(None);
             }
             match spawn_temporary_command(
+                ui.terminal,
                 &command,
                 focused.child_pid,
                 host,
@@ -4637,6 +4639,7 @@ async fn dispatch_client_action(
                 return Ok(None);
             }
             match spawn_temporary_command(
+                ui.terminal,
                 &command,
                 view.focused().child_pid,
                 host,
@@ -5140,6 +5143,7 @@ async fn dispatch_client_action(
 }
 
 async fn spawn_temporary_command(
+    terminal_config: crate::terminal::TerminalConfig,
     command: &PaletteCommand,
     child_pid: u32,
     host: Rect,
@@ -5152,11 +5156,10 @@ async fn spawn_temporary_command(
         anyhow::bail!("background commands cannot open an interactive surface");
     };
     let content = temporary_command_content(size.area(host));
-    let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
     TemporaryCommandSurface::spawn(
+        terminal_config,
         command,
         child_pid,
-        &fallback,
         TerminalSize {
             columns: content.width,
             rows: content.height,

@@ -5572,6 +5572,43 @@ async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
 }
 
 #[tokio::test]
+async fn configured_scrollback_budget_applies_to_initial_and_new_panes() {
+    let script = "seq 1 2000; printf SCROLL_READY; while :; do sleep 1; done";
+    let mut harness = Harness::start_with(script, |root| {
+        let directory = root.join("home/.config/fut");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("config.toml"),
+            "[terminal]\nscrollback_bytes = 0\n",
+        )
+        .unwrap();
+    })
+    .await;
+    let resources = harness.resources().await;
+    let tab = &resources.sessions[0].workspaces[0].tabs[0];
+    let initial_id = tab.panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id: tab.id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), script.into()],
+        })
+        .await
+    else {
+        panic!("failed to create pane");
+    };
+    for terminal_id in [initial_id, selected.terminal_id] {
+        let (mut client, _, _) = harness
+            .interactive_for(Some(TargetSelector::Terminal(terminal_id)))
+            .await;
+        let snapshot = snapshot_containing(&mut client, terminal_id, "SCROLL_READY").await;
+        assert_eq!(snapshot.scroll.max_offset_from_bottom, 0);
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_focus_to_bottom() {
     let mut harness = Harness::start(
         "i=0; while [ $i -le 40 ]; do printf 'HIST_%02d\\r\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'BOTTOM_%s\\r\\n' \"$line\"; done",

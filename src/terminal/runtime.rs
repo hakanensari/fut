@@ -47,6 +47,7 @@ const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
+    pub terminal: super::TerminalConfig,
     pub id: TerminalId,
     pub program: PathBuf,
     pub argv: Vec<String>,
@@ -652,7 +653,11 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let runtime = thread::Builder::new()
         .name(format!("fut-terminal-{id}"))
         .spawn(move || {
-            let mut terminal = match GhosttyTerminal::new(size, Arc::clone(&writer)) {
+            let mut terminal = match GhosttyTerminal::new(
+                size,
+                Arc::clone(&writer),
+                spec.terminal.scrollback_bytes,
+            ) {
                 Ok(terminal) => terminal,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -1669,12 +1674,14 @@ mod tests {
                 rows: 5,
             },
             Arc::new(Mutex::new(writer)),
+            super::super::DEFAULT_SCROLLBACK_BYTES,
         )
         .unwrap()
     }
 
     fn shell(script: &str, env: HashMap<OsString, OsString>) -> SpawnSpec {
         SpawnSpec {
+            terminal: crate::terminal::TerminalConfig::default(),
             id: TerminalId::new(),
             program: "/bin/sh".into(),
             argv: vec!["-c".into(), script.into()],
@@ -1713,6 +1720,24 @@ mod tests {
                 .collect::<String>();
             panic!("snapshot did not contain {needle:?}: {contents:?}");
         });
+    }
+
+    #[tokio::test]
+    async fn spawn_honors_scrollback_budget() {
+        for budget in [0, super::super::DEFAULT_SCROLLBACK_BYTES] {
+            let mut spec = shell("seq 1 2000; printf DONE; sleep 60", HashMap::new());
+            spec.terminal.scrollback_bytes = budget;
+            let handle = spawn_terminal(spec).unwrap();
+            let mut snapshots = handle.subscribe_snapshots();
+            wait_for_text(&mut snapshots, "DONE").await;
+            let history = snapshots.borrow().scroll.max_offset_from_bottom;
+            handle.close().await.unwrap();
+            if budget == 0 {
+                assert_eq!(history, 0);
+            } else {
+                assert!(history > 1900);
+            }
+        }
     }
 
     #[tokio::test]

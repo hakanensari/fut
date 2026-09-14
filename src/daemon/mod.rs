@@ -97,6 +97,7 @@ impl DaemonConfig {
             config_location,
             recipe_command_override: false,
             spawn: SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: TerminalId::new(),
                 program,
                 argv: Vec::new(),
@@ -140,6 +141,7 @@ struct SharedState {
     alert_changes: watch::Sender<u64>,
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<OsString, OsString>,
+    terminal_config: crate::terminal::TerminalConfig,
     projects: global_config::ProjectCatalog,
     config_location: global_config::ConfigLocation,
     extension_registry: Arc<crate::extensions::ExtensionRegistry>,
@@ -1691,6 +1693,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let config_location = config.config_location;
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
     let projects = global_config::load_projects_location(&config_location)?;
+    let terminal_config = global_config::load_terminal_location(&config_location)?;
     let extension_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
         1,
         loaded_extensions.extensions,
@@ -1722,6 +1725,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
+    initial_spawn.terminal = terminal_config;
     let child_env = initial_spawn.env.clone();
     let (resource_changes, _) = watch::channel(0);
     let (alert_changes, _) = watch::channel(0);
@@ -1739,6 +1743,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         alert_changes,
         agent_events,
         child_env,
+        terminal_config,
         projects,
         config_location,
         extension_registry,
@@ -5137,6 +5142,7 @@ async fn open_location_without_recipe(
         };
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: state.terminal_config,
                 id: spawn_target.terminal_id,
                 program,
                 argv,
@@ -5348,6 +5354,7 @@ async fn create_workspace(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: state.terminal_config,
                 id: proposed.terminal_id,
                 program,
                 argv,
@@ -5469,6 +5476,7 @@ async fn create_tab(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: state.terminal_config,
                 id: proposed.terminal_id,
                 program,
                 argv,
@@ -5637,6 +5645,7 @@ async fn create_pane(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: state.terminal_config,
                 id: terminal_id,
                 program,
                 argv,
@@ -7218,6 +7227,7 @@ mod tests {
 
     fn spawn_test_terminal(script: &str) -> TerminalHandle {
         spawn_terminal(SpawnSpec {
+            terminal: crate::terminal::TerminalConfig::default(),
             id: TerminalId::new(),
             program: "/bin/sh".into(),
             argv: vec!["-c".into(), script.into()],
@@ -7399,6 +7409,7 @@ mod tests {
 
         let first_terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: path.terminal_id,
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
@@ -7413,6 +7424,7 @@ mod tests {
         );
         let second_terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: second_terminal_id,
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
@@ -7515,6 +7527,7 @@ mod tests {
                 alert_changes: watch::channel(0).0,
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
+                terminal_config: crate::terminal::TerminalConfig::default(),
                 projects: global_config::ProjectCatalog::default(),
                 config_location: global_config::ConfigLocation {
                     path: None,
@@ -8111,6 +8124,7 @@ scope = "workspace"
         let (mut state, path) = inconsistent_state();
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: TerminalId::new(),
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "exit".into()],
@@ -8162,6 +8176,7 @@ scope = "workspace"
         };
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: TerminalId::new(),
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "exit 0".into()],
@@ -8217,6 +8232,7 @@ scope = "workspace"
         let (mut state, path) = inconsistent_state();
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
                 id: TerminalId::new(),
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "sleep 10".into()],
@@ -8262,6 +8278,7 @@ scope = "workspace"
         let spawn = || {
             Arc::new(
                 spawn_terminal(SpawnSpec {
+                    terminal: crate::terminal::TerminalConfig::default(),
                     id: TerminalId::new(),
                     program: "/bin/sh".into(),
                     argv: vec!["-c".into(), "sleep 10".into()],
@@ -8310,6 +8327,7 @@ scope = "workspace"
             alert_changes: watch::channel(0).0,
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
+            terminal_config: crate::terminal::TerminalConfig::default(),
             projects: global_config::ProjectCatalog::default(),
             config_location: global_config::ConfigLocation {
                 path: None,

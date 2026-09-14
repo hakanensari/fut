@@ -58,6 +58,27 @@ terminal bell arrives; whether that BEL is audible, visual, or ignored remains
 under the containing terminal emulator's control. It is deliberately off by
 default.
 
+## Terminal scrollback
+
+Fut retains up to **100 MiB of scrollback per terminal** by default. Storage grows
+as output arrives; the full budget is not allocated up front. Set a smaller or
+larger budget in bytes:
+
+```toml
+[terminal]
+scrollback_bytes = 104857600 # 100 MiB (default); 1073741824 is 1 GiB.
+```
+
+The budget measures terminal storage, not plain-text output or a fixed number of
+lines. Actual storage is subject to internal page sizes and minimum screen storage.
+Set `0` to disable scrollback.
+
+Pane terminals use the configuration loaded when the daemon starts. Restart the
+daemon to apply a changed budget to panes; client configuration reload does not
+resize existing history buffers. Newly opened command popups use the client's
+current setting after `Ctrl-b Shift-R`. Alternate-screen applications manage
+their own history.
+
 ## Example
 
 This example is intentionally customized; it is not a dump of the defaults.

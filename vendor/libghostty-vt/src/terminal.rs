@@ -241,7 +241,7 @@ pub struct Options {
     pub cols: u16,
     /// Terminal height in cells. Must be greater than zero.
     pub rows: u16,
-    /// Maximum number of lines to keep in scrollback history.
+    /// Maximum scrollback storage in bytes, subject to internal page sizes and minimum screen storage. Zero disables scrollback.
     pub max_scrollback: usize,
 }
 

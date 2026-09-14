@@ -120,7 +120,7 @@ pub(super) async fn create_initial(
         None,
         recipe,
     )?;
-    let terminals = match spawn_recipe_terminals(&plan, &state.child_env) {
+    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, state.terminal_config) {
         Ok(terminals) => terminals,
         Err((error, terminals)) => {
             close_spawned_terminals(terminals).await;
@@ -248,7 +248,7 @@ pub(super) async fn open_location(
     let plan = plan_recipe_session(resources, mutations, replacing, &resolved, name, &recipe)?;
     let selected_path = plan.selected;
     let disposition = plan.disposition;
-    let terminals = match spawn_recipe_terminals(&plan, &state.child_env) {
+    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, state.terminal_config) {
         Ok(terminals) => terminals,
         Err((error, terminals)) => {
             drop(state);
@@ -717,6 +717,7 @@ fn plan_recipe_session(
 fn spawn_recipe_terminals(
     plan: &RecipeCreationPlan,
     child_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
+    terminal_config: crate::terminal::TerminalConfig,
 ) -> RecipeSpawnResult {
     let mut terminals = Vec::with_capacity(plan.terminals.len());
     for terminal in &plan.terminals {
@@ -728,6 +729,7 @@ fn spawn_recipe_terminals(
                 .map(|(key, value)| (key.into(), value.into())),
         );
         let spec = SpawnSpec {
+            terminal: terminal_config,
             id: terminal.path.terminal_id,
             program: terminal.program.clone(),
             argv: terminal.argv.clone(),
@@ -1054,10 +1056,11 @@ panes = [{ command = ["pi"] }]
             disposition: OpenDisposition::SessionCreated,
             replacing: None,
         };
-        let (error, spawned) = match spawn_recipe_terminals(&plan, &HashMap::new()) {
-            Ok(_) => panic!("missing recipe command unexpectedly spawned"),
-            Err(failure) => failure,
-        };
+        let (error, spawned) =
+            match spawn_recipe_terminals(&plan, &HashMap::new(), Default::default()) {
+                Ok(_) => panic!("missing recipe command unexpectedly spawned"),
+                Err(failure) => failure,
+            };
         assert_eq!(error.code, "spawn_failed");
         assert_eq!(spawned.len(), 1);
         let pid = spawned[0].child_pid() as libc::pid_t;

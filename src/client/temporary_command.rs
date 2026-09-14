@@ -179,9 +179,9 @@ pub(super) enum TemporaryCommandUpdate {
 
 impl TemporaryCommandSurface {
     pub(super) async fn spawn(
+        terminal_config: crate::terminal::TerminalConfig,
         command: &PaletteCommand,
         pid: u32,
-        fallback: &Path,
         size: TerminalSize,
         socket_path: &Path,
         extension_context: Option<&ExtensionCommandContext>,
@@ -199,7 +199,7 @@ impl TemporaryCommandSurface {
         } else {
             process_cwd(foreground_process_id(pid).await)
                 .await
-                .unwrap_or_else(|| fallback.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()))
         };
         let mut env = std::env::vars_os().collect::<HashMap<_, _>>();
         if command.extension.is_some() {
@@ -219,6 +219,7 @@ impl TemporaryCommandSurface {
             );
         }
         let handle = spawn_terminal(SpawnSpec {
+            terminal: terminal_config,
             id: terminal_id,
             program: command.program.clone(),
             argv: command.args.clone(),
@@ -1149,11 +1150,10 @@ mod tests {
 
     #[tokio::test]
     async fn exit_restores_by_completing_the_temporary_surface() {
-        let cwd = std::env::current_dir().unwrap();
         let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
             &command("/bin/sh", &["-c", "exit 0"]),
             std::process::id(),
-            &cwd,
             TerminalSize {
                 columns: 40,
                 rows: 10,
@@ -1185,9 +1185,9 @@ mod tests {
             input.display()
         );
         let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
             &command("/bin/sh", &["-c", &script]),
             std::process::id(),
-            temporary.path(),
             TerminalSize {
                 columns: 20,
                 rows: 4,
@@ -1277,9 +1277,9 @@ mod tests {
             capture.display()
         );
         let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
             &command("/bin/sh", &["-c", &script]),
             std::process::id(),
-            temporary.path(),
             TerminalSize {
                 columns: 20,
                 rows: 4,
@@ -1347,12 +1347,11 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_failures_are_returned_without_a_surface() {
-        let cwd = std::env::current_dir().unwrap();
         assert!(
             TemporaryCommandSurface::spawn(
+                Default::default(),
                 &command("/definitely/not/a/fut-command", &[]),
                 std::process::id(),
-                &cwd,
                 TerminalSize {
                     columns: 40,
                     rows: 10
@@ -1371,9 +1370,9 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
             &command("/bin/sh", &["-c", "printf 'actionable failure\\n'; exit 2"]),
             std::process::id(),
-            temporary.path(),
             TerminalSize {
                 columns: 40,
                 rows: 10,
@@ -1452,11 +1451,10 @@ mod tests {
             },
             active_extensions: r#"{"other":"2.0.0","test-extension":"1.0.0"}"#.into(),
         };
-        let cwd = std::env::current_dir().unwrap();
         let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
             &launch,
             std::process::id(),
-            &cwd,
             TerminalSize {
                 columns: 40,
                 rows: 10,

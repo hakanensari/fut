@@ -1432,6 +1432,8 @@ pub(crate) struct UiConfig {
     #[serde(skip)]
     pub(super) alerts: AlertsConfig,
     #[serde(skip)]
+    pub(super) terminal: crate::terminal::TerminalConfig,
+    #[serde(skip)]
     pub(super) extensions: Vec<Extension>,
     #[serde(skip)]
     extension_config: ExtensionConfigCatalog,
@@ -1450,6 +1452,7 @@ impl Default for UiConfig {
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
             alerts: AlertsConfig::default(),
+            terminal: crate::terminal::TerminalConfig::default(),
             extensions: Vec::new(),
             extension_config: ExtensionConfigCatalog::default(),
         }
@@ -1494,6 +1497,7 @@ impl UiConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
+    terminal: crate::terminal::TerminalConfig,
     ui: UiConfig,
     alerts: AlertsConfig,
     trusted_commands: BTreeMap<String, PaletteCommand>,
@@ -1745,6 +1749,26 @@ pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
         })
 }
 
+/// Read daemon terminal settings independently of client presentation settings.
+pub(crate) fn load_terminal_location(
+    location: &ConfigLocation,
+) -> Result<crate::terminal::TerminalConfig> {
+    #[derive(Default, Deserialize)]
+    struct TerminalSettings {
+        #[serde(default)]
+        terminal: crate::terminal::TerminalConfig,
+    }
+    let Some(path) = &location.path else {
+        return Ok(crate::terminal::TerminalConfig::default());
+    };
+    let Some(source) = read_config_source(path, location.explicit)? else {
+        return Ok(crate::terminal::TerminalConfig::default());
+    };
+    let config: TerminalSettings = toml::from_str(&source)
+        .with_context(|| format!("parse terminal config from {}", path.display()))?;
+    Ok(config.terminal)
+}
+
 /// Load the durable project catalog without making control commands depend on
 /// unrelated presentation configuration. Project entries are still strict and
 /// bounded by the same global configuration file reader.
@@ -1912,6 +1936,7 @@ fn materialize_config(
     source: Option<&Path>,
 ) -> Result<UiConfig> {
     config.ui.alerts = config.alerts;
+    config.ui.terminal = config.terminal;
     let prefix = parse_key(&config.ui.prefix)
         .map(|(bytes, _)| bytes)
         .context("ui.prefix must be one character or a named key such as ctrl-a")?;
@@ -2714,6 +2739,60 @@ fn validate_text(path: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_scrollback_settings_load_for_client_and_daemon() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: false,
+            source: "test",
+        };
+        assert_eq!(
+            load_terminal_location(&location).unwrap().scrollback_bytes,
+            100 * 1024 * 1024
+        );
+        for budget in [0, 1024 * 1024, 1024 * 1024 * 1024] {
+            fs::write(&path, format!("[terminal]\nscrollback_bytes = {budget}\n")).unwrap();
+            assert_eq!(
+                load_terminal_location(&location).unwrap().scrollback_bytes,
+                budget
+            );
+            let staged = stage_location(&location).unwrap();
+            let ui = materialize_config(staged.config, Vec::new(), Default::default(), Some(&path))
+                .unwrap();
+            assert_eq!(ui.terminal.scrollback_bytes, budget);
+        }
+        for invalid in [
+            "scrollback_bytes = -1",
+            "scrollback_bytes = '100 MiB'",
+            "scrollback_lines = 1000",
+        ] {
+            fs::write(&path, format!("[terminal]\n{invalid}\n")).unwrap();
+            assert!(load_terminal_location(&location).is_err());
+            assert!(stage_location(&location).is_err());
+        }
+        fs::write(
+            &path,
+            "[terminal]\nscrollback_bytes = 42\n[ui]\ninvalid = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_terminal_location(&location).unwrap().scrollback_bytes,
+            42
+        );
+        assert!(stage_location(&location).is_err());
+        assert_eq!(
+            load_terminal_location(&ConfigLocation {
+                path: None,
+                explicit: false,
+                source: "--no-config"
+            })
+            .unwrap(),
+            Default::default()
+        );
+    }
 
     #[test]
     fn project_catalog_loads_without_validating_ui_and_expands_home() {

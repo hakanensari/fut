@@ -2027,7 +2027,7 @@ pub struct TerminalOptions {
     pub cols: u16,
     #[doc = " Terminal height in cells. Must be greater than zero."]
     pub rows: u16,
-    #[doc = " Maximum number of lines to keep in scrollback history."]
+    #[doc = " Maximum scrollback storage in bytes, subject to internal page sizes and minimum screen storage. Zero disables scrollback."]
     pub max_scrollback: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]

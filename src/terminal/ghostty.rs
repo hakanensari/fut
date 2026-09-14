@@ -170,22 +170,23 @@ impl GhosttyTerminal {
     pub(super) fn new(
         size: TerminalSize,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        scrollback_bytes: usize,
     ) -> Result<Self> {
-        Self::new_with_limits(size, writer, 10_000, MAX_COPY_CELLS)
+        Self::new_with_limits(size, writer, scrollback_bytes, MAX_COPY_CELLS)
     }
 
     // Keep unit fixtures small while exercising the same pruning and copy checks.
     fn new_with_limits(
         size: TerminalSize,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
-        max_scrollback: usize,
+        scrollback_bytes: usize,
         max_copy_cells: usize,
     ) -> Result<Self> {
         validate_size(size)?;
         let mut terminal = Terminal::new(TerminalOptions {
             cols: size.columns,
             rows: size.rows,
-            max_scrollback,
+            max_scrollback: scrollback_bytes,
         })?;
         graphics::set_png_decoder(Some(Box::new(graphics::RustPngDecoder::default())))?;
         terminal.set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_BYTES)?;
@@ -2039,6 +2040,7 @@ mod tests {
         GhosttyTerminal::new(
             TerminalSize { columns, rows },
             Arc::new(Mutex::new(Box::new(io::sink()))),
+            super::super::DEFAULT_SCROLLBACK_BYTES,
         )
         .unwrap()
     }
@@ -2048,6 +2050,7 @@ mod tests {
         let terminal = GhosttyTerminal::new(
             TerminalSize { columns, rows },
             Arc::new(Mutex::new(Box::new(RecordingWriter(Arc::clone(&output))))),
+            super::super::DEFAULT_SCROLLBACK_BYTES,
         )
         .unwrap();
         (terminal, output)
@@ -3546,6 +3549,25 @@ mod tests {
             Err(CopyModeFailure::CursorLost { .. })
         ));
         assert!(!reset.copy_modes.contains_key(&owner));
+    }
+
+    #[test]
+    fn default_scrollback_retains_long_agent_sessions_and_smaller_budgets_prune() {
+        let mut large = terminal(120, 24);
+        let mut small = GhosttyTerminal::new(
+            TerminalSize {
+                columns: 120,
+                rows: 24,
+            },
+            Arc::new(Mutex::new(Box::new(io::sink()))),
+            1024 * 1024,
+        )
+        .unwrap();
+        let output = "agent output\r\n".repeat(4_000);
+        large.feed(output.as_bytes()).unwrap();
+        small.feed(output.as_bytes()).unwrap();
+        assert_eq!(large.terminal.scrollback_rows().unwrap(), 4_000 - 23);
+        assert!(small.terminal.scrollback_rows().unwrap() < 2_000);
     }
 
     #[test]
