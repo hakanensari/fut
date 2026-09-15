@@ -3,7 +3,7 @@ description: Agent-aware terminal multiplexing
 url: https://fut.sh
 baseurl: ""
 repository: mikker/fut
-version: "0.19"
+version: "0.20"
 markdown: kramdown
 permalink: pretty
 relative_links:
