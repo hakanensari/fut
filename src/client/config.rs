@@ -1503,6 +1503,7 @@ struct Config {
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
+    projects_dir: Option<PathBuf>,
     projects: BTreeMap<String, ProjectConfig>,
     #[serde(deserialize_with = "deserialize_extension_config_catalog")]
     extension: BTreeMap<String, ExtensionConfigTable>,
@@ -1531,17 +1532,29 @@ impl ProjectConfig {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProjectCatalog {
+    directory: Option<PathBuf>,
     projects: BTreeMap<String, ProjectConfig>,
 }
 
 impl ProjectCatalog {
     #[cfg(test)]
     pub(crate) fn from_projects(projects: BTreeMap<String, ProjectConfig>) -> Self {
-        Self { projects }
+        Self {
+            directory: None,
+            projects,
+        }
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&ProjectConfig> {
         self.projects.get(name)
+    }
+
+    pub(crate) fn resolve(&self, name: &str) -> Option<ProjectConfig> {
+        if let Some(project) = self.get(name) {
+            return Some(project.clone());
+        }
+        let directory = self.directory.as_ref()?;
+        valid_project_name(name).then(|| ProjectConfig::repository(directory.join(name)))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &ProjectConfig)> {
@@ -1783,13 +1796,16 @@ pub(crate) fn load_projects_location(location: &ConfigLocation) -> Result<Projec
     #[derive(Default, Deserialize)]
     struct ProjectsConfig {
         #[serde(default)]
+        projects_dir: Option<PathBuf>,
+        #[serde(default)]
         projects: BTreeMap<String, ProjectConfig>,
     }
 
     let mut config = toml::from_str::<ProjectsConfig>(&source)
         .with_context(|| format!("parse project catalog from {}", path.display()))?;
-    validate_projects(&mut config.projects, path)?;
+    validate_projects(&mut config.projects_dir, &mut config.projects, path)?;
     Ok(ProjectCatalog {
+        directory: config.projects_dir,
         projects: config.projects,
     })
 }
@@ -1986,7 +2002,7 @@ fn materialize_config(
         bail!("unknown extension_commands command {slug:?}");
     }
     let source = source.unwrap_or_else(|| Path::new("default Fut config"));
-    validate_projects(&mut config.projects, source)?;
+    validate_projects(&mut config.projects_dir, &mut config.projects, source)?;
     validate(&config.ui, &extensions)
         .with_context(|| format!("validate Fut config {}", source.display()))?;
     config.ui.extensions = extensions;
@@ -1994,16 +2010,24 @@ fn materialize_config(
     Ok(config.ui)
 }
 
-fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Path) -> Result<()> {
+fn validate_projects(
+    projects_dir: &mut Option<PathBuf>,
+    projects: &mut BTreeMap<String, ProjectConfig>,
+    source: &Path,
+) -> Result<()> {
     let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(directory) = projects_dir {
+        *directory = expand_home_path(directory, home.as_deref(), "projects directory")?;
+        if !directory.is_absolute() {
+            bail!(
+                "projects_dir in {} must be absolute or start with ~/",
+                source.display()
+            );
+        }
+    }
     let mut paths = BTreeMap::<PathBuf, String>::new();
     for (name, project) in projects {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !valid_project_name(name) {
             bail!(
                 "invalid project name {name:?} in {}; use 1-64 ASCII letters, numbers, '-' or '_'",
                 source.display()
@@ -2033,6 +2057,14 @@ fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Pa
         }
     }
     Ok(())
+}
+
+fn valid_project_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn expand_home_path(path: &Path, home: Option<&Path>, kind: &str) -> Result<PathBuf> {
@@ -2829,6 +2861,29 @@ unknown_future_option = true
             .unwrap(),
             temporary.path().join("dev/fut")
         );
+    }
+
+    #[test]
+    fn project_catalog_resolves_unknown_names_below_projects_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            format!("projects_dir = {:?}\n", temporary.path().join("dev")),
+        )
+        .unwrap();
+        let location = ConfigLocation {
+            path: Some(path),
+            explicit: true,
+            source: "test",
+        };
+
+        let catalog = load_projects_location(&location).unwrap();
+        assert_eq!(
+            catalog.resolve("10er").unwrap().path(),
+            temporary.path().join("dev/10er")
+        );
+        assert!(catalog.resolve("../outside").is_none());
     }
 
     #[test]

@@ -2684,7 +2684,7 @@ async fn resolve_project_open(
 ) -> Result<(PathBuf, Option<String>, client::config::ProjectConfig)> {
     let catalog = client::config::load_projects_location(config_location)?;
     if let Some(project_name) = project {
-        let configured = catalog_project(&catalog, project_name)?.clone();
+        let configured = catalog_project(&catalog, project_name)?;
         let cwd = path.map_or_else(
             || configured.path().to_owned(),
             |path| resolve_open_path(Some(path), current_dir),
@@ -2726,11 +2726,11 @@ async fn resolve_project_open(
     Ok((cwd, name, recipe_project))
 }
 
-fn catalog_project<'a>(
-    catalog: &'a client::config::ProjectCatalog,
+fn catalog_project(
+    catalog: &client::config::ProjectCatalog,
     name: &str,
-) -> Result<&'a client::config::ProjectConfig> {
-    catalog.get(name).ok_or_else(|| {
+) -> Result<client::config::ProjectConfig> {
+    catalog.resolve(name).ok_or_else(|| {
         let available = catalog
             .iter()
             .map(|(name, _)| name)
@@ -5491,6 +5491,29 @@ mod tests {
             .0,
             linked
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_project_falls_back_to_projects_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let projects = temporary.path().join("dev");
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            format!("projects_dir = {:?}\n", projects),
+        )
+        .unwrap();
+        let config_location = client::config::resolve_location(Some(&config)).unwrap();
+
+        let (cwd, name, recipe_project) =
+            resolve_project_open(None, Some("10er"), temporary.path(), &config_location)
+                .await
+                .unwrap();
+
+        assert_eq!(cwd, projects.join("10er"));
+        assert_eq!(name.as_deref(), Some("10er"));
+        assert_eq!(recipe_project.path(), projects.join("10er"));
     }
 
     #[tokio::test]

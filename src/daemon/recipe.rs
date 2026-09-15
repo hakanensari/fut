@@ -144,13 +144,14 @@ pub(super) async fn open_location(
     argv: Vec<String>,
 ) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
     let resolved = ProjectResolver::default().resolve(&cwd).await?;
-    let catalog = {
+    let config_location = {
         let state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
-        state.projects.clone()
+        state.config_location.clone()
     };
+    let catalog = load_project_catalog(&config_location)?;
     let recipe_project = recipe_project(&catalog, project.as_deref(), &resolved).await?;
     let extension_registry = {
         let state = shared.lock().await;
@@ -280,7 +281,7 @@ async fn recipe_project(
 ) -> Result<global_config::ProjectConfig, DaemonError> {
     let resolver = ProjectResolver::default();
     if let Some(name) = explicit_name {
-        let project = catalog.get(name).cloned().ok_or_else(|| {
+        let project = catalog.resolve(name).ok_or_else(|| {
             let available = catalog
                 .iter()
                 .map(|(name, _)| name)
@@ -360,16 +361,17 @@ pub(super) async fn reload_project_config(
     shared: &Shared,
     session_id: SessionId,
 ) -> Result<(u64, bool), DaemonError> {
-    let (catalog, extensions, project, workspace_root) = {
+    let (config_location, extensions, project, workspace_root) = {
         let state = shared.lock().await;
         let (project, workspace_root) = state.resources.session_project_context(session_id)?;
         (
-            state.projects.clone(),
+            state.config_location.clone(),
             Arc::clone(&state.extension_registry),
             project,
             workspace_root,
         )
     };
+    let catalog = load_project_catalog(&config_location)?;
     let resolved = ProjectResolver::default().resolve(&workspace_root).await?;
     if resolved.project != project {
         return Err(DaemonError::new(
@@ -398,6 +400,17 @@ pub(super) async fn reload_project_config(
         state.publish_resource_change(revision);
     }
     Ok((revision, changed))
+}
+
+fn load_project_catalog(
+    location: &global_config::ConfigLocation,
+) -> Result<global_config::ProjectCatalog, DaemonError> {
+    global_config::load_projects_location(location).map_err(|error| {
+        DaemonError::new(
+            "invalid_config",
+            format!("reload project catalog: {error:#}"),
+        )
+    })
 }
 
 async fn prepare_recipe(

@@ -142,7 +142,6 @@ struct SharedState {
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<OsString, OsString>,
     terminal_config: crate::terminal::TerminalConfig,
-    projects: global_config::ProjectCatalog,
     config_location: global_config::ConfigLocation,
     extension_registry: Arc<crate::extensions::ExtensionRegistry>,
     extension_catalog: watch::Sender<crate::protocol::ExtensionCatalog>,
@@ -1744,7 +1743,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         agent_events,
         child_env,
         terminal_config,
-        projects,
         config_location,
         extension_registry,
         extension_catalog,
@@ -7528,7 +7526,6 @@ mod tests {
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
                 terminal_config: crate::terminal::TerminalConfig::default(),
-                projects: global_config::ProjectCatalog::default(),
                 config_location: global_config::ConfigLocation {
                     path: None,
                     explicit: false,
@@ -8328,7 +8325,6 @@ scope = "workspace"
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
             terminal_config: crate::terminal::TerminalConfig::default(),
-            projects: global_config::ProjectCatalog::default(),
             config_location: global_config::ConfigLocation {
                 path: None,
                 explicit: false,

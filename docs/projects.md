@@ -15,6 +15,8 @@ from trusted recipes.
 Declare projects in the global [configuration](configuration.md):
 
 ```toml
+projects_dir = "~/dev"
+
 [projects.fut]
 path = "~/dev/fut"
 
@@ -27,6 +29,9 @@ Project names use ASCII letters, numbers, `-`, or `_` and must be unique. Paths
 must be absolute or begin with `~/`; Fut performs no filesystem scanning or
 shell interpolation. Open and attach to a catalog entry with
 `fut open -p fut` (or `--project fut`), or add `-b` to open it in the background.
+When `projects_dir` is set, a project name not in the explicit catalog falls
+back to a directory with that name below it, so `fut open -p website` opens
+`~/dev/website` in this example. Explicit catalog entries take precedence.
 An optional path may select a linked checkout, for example
 `fut open ../fut-feature --project fut`; Fut verifies that the path has the same
 Git project identity as the configured root before opening it as a peer
@@ -50,11 +55,10 @@ fut project list
 fut project ls
 ```
 
-The daemon loads the catalog at startup. Restart it after changing a project
-path or `recipe`; `Ctrl-b Shift-R` reloads the active recipe's extension table,
-but does not change the daemon's project catalog. Repository recipe approvals
-are checked separately each time Fut boots or reloads a project session, so
-approving or revoking one does not require a daemon restart.
+Fut rereads the project catalog for every project open, so changing a project
+path, `recipe`, or `projects_dir` does not require a daemon restart. Repository
+recipe approvals are checked separately each time Fut boots or reloads a
+project session, so approving or revoking one does not require a daemon restart.
 
 ## Trusted recipes
 

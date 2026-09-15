@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Project opens now reread the global catalog without requiring a daemon restart.
+- Added `projects_dir` as a fallback root for project names absent from the explicit catalog.
 - Increased terminal scrollback to 100 MiB by default and added a configurable per-terminal budget.
 - Local project recipes are now discovered outside the global projects list, support path-based trust commands and scriptable trust status, and open one default shell when no layout is declared.
 - Added a session message log for reading full toast text, available from the command palette, `Ctrl-b m`, or by clicking a toast.
