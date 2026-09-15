@@ -407,9 +407,11 @@ pub async fn launch_ui_playground(config_location: &config::ConfigLocation) -> a
 pub async fn attach_navigator(
     socket_path: &Path,
     config_location: &config::ConfigLocation,
+    ignore_protocol_mismatch: bool,
 ) -> anyhow::Result<()> {
     let staged = stage_ui_config(config_location)?;
-    let (mut navigator_connection, catalog) = connect_control_navigator(socket_path).await?;
+    let (mut navigator_connection, catalog, protocol_version) =
+        connect_control_navigator(socket_path, ignore_protocol_mismatch).await?;
     let ui = staged.materialize(&catalog)?;
     let (snapshot, presence) =
         match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
@@ -446,6 +448,7 @@ pub async fn attach_navigator(
         Some(selector),
         size,
         alert_client_id(socket_path)?,
+        protocol_version,
     )
     .await?;
     let ui = staged.materialize(&catalog)?;
@@ -485,6 +488,7 @@ pub(crate) async fn attach_with_ui(
         selector,
         TerminalSize { columns, rows },
         alert_client_id,
+        PROTOCOL_VERSION,
     )
     .await?;
     let ui = staged.materialize(&catalog)?;
@@ -571,6 +575,7 @@ async fn connect_interactive(
     selector: Option<TargetSelector>,
     size: TerminalSize,
     alert_client_id: crate::domain::ClientId,
+    protocol_version: u16,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     SelectedView,
@@ -584,7 +589,7 @@ async fn connect_interactive(
     send(
         &mut framed,
         ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
+            version: protocol_version,
             client_version: env!("CARGO_PKG_VERSION").into(),
             mode: ClientMode::Interactive { size, selector },
         },
@@ -599,7 +604,7 @@ async fn connect_interactive(
             selected: Some(selected),
             extension_catalog,
             ..
-        } if version == PROTOCOL_VERSION => (selected, extension_catalog),
+        } if version == protocol_version => (selected, extension_catalog),
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -631,9 +636,40 @@ async fn connect_interactive(
 
 async fn connect_control_navigator(
     socket_path: &Path,
+    ignore_protocol_mismatch: bool,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
+    u16,
+)> {
+    match connect_control_navigator_with_version(socket_path, PROTOCOL_VERSION).await {
+        Err(error) if ignore_protocol_mismatch => {
+            if let Some(mismatch) = error.downcast_ref::<ProtocolMismatch>() {
+                connect_control_navigator_with_version(socket_path, mismatch.server).await
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "incompatible protocol: client {client}, server {server}; run `fut daemon shutdown --force` to terminate the old daemon"
+)]
+struct ProtocolMismatch {
+    client: u16,
+    server: u16,
+}
+
+async fn connect_control_navigator_with_version(
+    socket_path: &Path,
+    protocol_version: u16,
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    crate::protocol::ExtensionCatalog,
+    u16,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -642,7 +678,7 @@ async fn connect_control_navigator(
     send(
         &mut framed,
         ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
+            version: protocol_version,
             client_version: env!("CARGO_PKG_VERSION").into(),
             mode: ClientMode::Control,
         },
@@ -657,12 +693,9 @@ async fn connect_control_navigator(
             selected: None,
             extension_catalog,
             ..
-        } if version == PROTOCOL_VERSION => extension_catalog,
+        } if version == protocol_version => extension_catalog,
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!(
-                "incompatible protocol: client {client}, server {server}; run `fut daemon \
-                 shutdown --force` to terminate the old daemon"
-            )
+            bail!(ProtocolMismatch { client, server });
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected control welcome from daemon, received {message:?}"),
@@ -673,7 +706,7 @@ async fn connect_control_navigator(
         ClientMessage::WatchResources,
     )
     .await?;
-    Ok((framed, extension_catalog))
+    Ok((framed, extension_catalog, protocol_version))
 }
 
 async fn initial_navigator(
@@ -6877,6 +6910,55 @@ fn clear_host_screen(writer: &mut impl io::Write) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{Cell, Cursor, PaneId, Rgb, SessionId, TabId, WorkspaceId};
+
+    #[tokio::test]
+    async fn navigator_protocol_escape_hatch_retries_with_the_daemon_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server_version = PROTOCOL_VERSION - 1;
+        let server = tokio::spawn(async move {
+            for expected_version in [PROTOCOL_VERSION, server_version] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(stream, codec());
+                let request = framed.next().await.unwrap().unwrap();
+                let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+                assert!(matches!(
+                    hello.message,
+                    ClientMessage::Hello { version, .. } if version == expected_version
+                ));
+                let message = if expected_version == PROTOCOL_VERSION {
+                    ServerMessage::IncompatibleProtocol {
+                        client: PROTOCOL_VERSION,
+                        server: server_version,
+                    }
+                } else {
+                    ServerMessage::Error {
+                        code: "done".into(),
+                        message: "negotiated".into(),
+                    }
+                };
+                framed
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message,
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let error = connect_control_navigator(&socket, true).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("daemon error (done): negotiated")
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn concurrent_clients_share_one_complete_retained_alert_identity() {

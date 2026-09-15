@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added `fut attach --ignore-protocol-mismatch` as an explicit escape hatch for accessing older daemons.
+
 ## 0.21
 
 - Fixed input racing a terminal exit from disconnecting the Fut client before focus could transfer.

@@ -125,7 +125,11 @@ where
 enum Command {
     /// Attach to an existing daemon with the global navigator open.
     #[command(alias = "a")]
-    Attach,
+    Attach {
+        /// Connect even when the daemon uses a different protocol version.
+        #[arg(long)]
+        ignore_protocol_mismatch: bool,
+    },
     /// Open a location and attach to it.
     #[command(alias = "o")]
     Open {
@@ -1110,7 +1114,9 @@ async fn execute(cli: Cli) -> Result<()> {
             )?;
             open_and_attach(&socket, cwd, &config_location).await
         }
-        Some(Command::Attach) => client::attach_navigator(&socket, &config_location).await,
+        Some(Command::Attach {
+            ignore_protocol_mismatch,
+        }) => client::attach_navigator(&socket, &config_location, ignore_protocol_mismatch).await,
         Some(Command::Open {
             path,
             project,
@@ -3154,7 +3160,7 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
 
 fn attaches_client(command: &Option<Command>) -> bool {
     command.is_none()
-        || matches!(command, Some(Command::Attach))
+        || matches!(command, Some(Command::Attach { .. }))
         || matches!(
             command,
             Some(Command::Open {
@@ -5412,7 +5418,23 @@ mod tests {
 
         let with_command = Cli::try_parse_from(["fut", "--ui-playground", "attach"]).unwrap();
         assert!(with_command.ui_playground);
-        assert!(matches!(with_command.command, Some(Command::Attach)));
+        assert!(matches!(
+            with_command.command,
+            Some(Command::Attach {
+                ignore_protocol_mismatch: false
+            })
+        ));
+    }
+
+    #[test]
+    fn attach_can_ignore_a_protocol_mismatch() {
+        let cli = Cli::try_parse_from(["fut", "a", "--ignore-protocol-mismatch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Attach {
+                ignore_protocol_mismatch: true
+            })
+        ));
     }
 
     #[test]

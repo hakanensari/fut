@@ -43,6 +43,10 @@ session      a project-level container
 Use `fut attach` to open the global navigator before attaching, or target an
 unambiguous resource directly with `fut session attach`, `fut workspace
 attach`, `fut tab attach`, `fut pane attach`, or `fut terminal attach`.
+For temporary access to a daemon from another Fut version, `fut attach
+--ignore-protocol-mismatch` retries using the daemon's protocol. This is an
+unsafe compatibility escape hatch; unsupported protocol changes may still
+cause the client to fail.
 
 Fut refuses to start a nested interactive client inside one of its terminals.
 If nesting is intentional, run `FUT_ALLOW_NESTED=1 fut`.
