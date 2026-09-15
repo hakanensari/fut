@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.21
+
 - Fixed input racing a terminal exit from disconnecting the Fut client before focus could transfer.
 
 ## 0.20
