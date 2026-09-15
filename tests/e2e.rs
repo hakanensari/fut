@@ -4930,6 +4930,11 @@ async fn interactive_create_tab_correlates_ack_switches_atomically_and_routes_in
         }
         match response.message {
             ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, old_terminal),
+            ServerMessage::ResourcesChanged { snapshot } => assert_eq!(
+                without_observations(snapshot),
+                without_observations(resources.clone()),
+                "resource mutation became visible before TabCreated"
+            ),
             other => panic!("unexpected frame before TabCreated: {other:?}"),
         }
     };
@@ -5021,6 +5026,11 @@ async fn interactive_create_pane_correlates_ack_switches_atomically_and_holds_le
         }
         match response.message {
             ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, old_terminal),
+            ServerMessage::ResourcesChanged { snapshot } => assert_eq!(
+                without_observations(snapshot),
+                without_observations(resources.clone()),
+                "resource mutation became visible before PaneCreated"
+            ),
             other => panic!("unexpected frame before PaneCreated: {other:?}"),
         }
     };
@@ -6000,8 +6010,14 @@ async fn raw_mouse_input_reaches_only_the_attachments_focused_terminal() {
         .interactive_for(Some(TargetSelector::Terminal(terminal_a)))
         .await;
     assert_eq!(selected, terminal_a);
-    snapshot_containing(&mut connection, terminal_a, "RAW_MOUSE_A_READY").await;
-    snapshot_containing(&mut connection, pane_b.terminal_id, "RAW_MOUSE_B_READY").await;
+    snapshots_containing_all(
+        &mut connection,
+        &[
+            (terminal_a, "RAW_MOUSE_A_READY"),
+            (pane_b.terminal_id, "RAW_MOUSE_B_READY"),
+        ],
+    )
+    .await;
 
     for event in [
         mouse_event(
@@ -9375,17 +9391,30 @@ async fn public_client_preserves_host_palette_indices_and_truecolor() {
             harness.socket.display(),
         ));
     let mut client = PtyChild::spawn(command);
-    client.wait_for("PALETTE_RED").await;
-    client.wait_for("EXACT_RGB").await;
-    let output = client.text();
-    let content = output
-        .find("PALETTE_RED")
-        .expect("rendered output contains palette fixture");
-    assert!(
-        output[..content].rfind("\x1b[?2026h").is_some()
-            && output[content..].find("\x1b[?2026l").is_some(),
-        "client frame was not emitted atomically: {output:?}"
-    );
+    let output = time::timeout(DEADLINE, async {
+        loop {
+            let output = client.text();
+            if let Some(content) = output.find("PALETTE_RED")
+                && output.contains("EXACT_RGB")
+                && output[..content].rfind("\x1b[?2026h").is_some()
+                && output[content..].find("\x1b[?2026l").is_some()
+            {
+                return output;
+            }
+            assert!(
+                client.child.try_wait().unwrap().is_none(),
+                "PTY child exited before complete synchronized frame: {output:?}"
+            );
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "client frame was not emitted atomically: {:?}",
+            client.text()
+        )
+    });
     assert!(
         output.contains("\x1b[38;5;1;49mPALETTE_RED"),
         "indexed ANSI color was not emitted as a palette reference: {output:?}"
