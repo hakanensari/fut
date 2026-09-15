@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-## 0.19
+- Fixed input racing a terminal exit from disconnecting the Fut client before focus could transfer.
+
+## 0.20
 
 - Project opens now refresh the global catalog without a daemon restart and resolve uncatalogued names from `projects_dir`.
 - Increased terminal scrollback to 100 MiB by default and added a configurable per-terminal budget.

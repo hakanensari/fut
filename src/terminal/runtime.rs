@@ -766,7 +766,7 @@ fn run(
                         .map_err(|_| anyhow!("PTY writer lock poisoned"))
                         .and_then(|mut writer| writer.write_all(&bytes).map_err(Into::into))
                     {
-                        send_error(publishers.events, error);
+                        send_input_error(publishers.events, terminal_input_error(error));
                     }
                 }
                 RuntimeMessage::KeyInput(event) => {
@@ -777,7 +777,7 @@ fn run(
                         &mut reader_complete,
                         event,
                     ) {
-                        send_error(publishers.events, error.into());
+                        send_input_error(publishers.events, error);
                     }
                 }
                 RuntimeMessage::Paste { text, completion } => {
@@ -1223,9 +1223,10 @@ fn paste_after_output_barrier(
     text: String,
 ) -> Result<(), CommandError> {
     drain_output_barrier(output, terminal, publishers, reader_complete);
-    terminal
-        .paste(text)
-        .map_err(|error| CommandError::Emulator(error.to_string()))
+    if *reader_complete {
+        return Err(CommandError::Stopped);
+    }
+    terminal.paste(text).map_err(terminal_input_error)
 }
 
 fn key_input_after_output_barrier(
@@ -1236,9 +1237,10 @@ fn key_input_after_output_barrier(
     event: crate::domain::TerminalKeyEvent,
 ) -> Result<(), CommandError> {
     drain_output_barrier(output, terminal, publishers, reader_complete);
-    terminal
-        .key_input(event)
-        .map_err(|error| CommandError::Emulator(error.to_string()))
+    if *reader_complete {
+        return Err(CommandError::Stopped);
+    }
+    terminal.key_input(event).map_err(terminal_input_error)
 }
 
 fn paste_and_input_after_output_barrier(
@@ -1250,9 +1252,12 @@ fn paste_and_input_after_output_barrier(
     input: &[u8],
 ) -> Result<(), CommandError> {
     drain_output_barrier(output, terminal, publishers, reader_complete);
+    if *reader_complete {
+        return Err(CommandError::Stopped);
+    }
     terminal
         .paste_and_input(text, input)
-        .map_err(|error| CommandError::Emulator(error.to_string()))
+        .map_err(terminal_input_error)
 }
 
 fn mouse_input_after_output_barrier(
@@ -1265,9 +1270,23 @@ fn mouse_input_after_output_barrier(
     pty_input_allowed: bool,
 ) -> Result<MouseInputOutcome, CommandError> {
     drain_output_barrier(output, terminal, publishers, reader_complete);
+    if *reader_complete {
+        return Err(CommandError::Stopped);
+    }
     terminal
         .mouse_input(event, viewport_offset, pty_input_allowed)
-        .map_err(|error| CommandError::Emulator(error.to_string()))
+        .map_err(terminal_input_error)
+}
+
+fn terminal_input_error(error: anyhow::Error) -> CommandError {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    {
+        CommandError::Stopped
+    } else {
+        CommandError::Emulator(error.to_string())
+    }
 }
 
 fn drain_output_barrier(
@@ -1616,6 +1635,11 @@ fn send_error(events: &broadcast::Sender<TerminalEvent>, error: anyhow::Error) {
     let _ = events.send(TerminalEvent::Error {
         message: error.to_string(),
     });
+}
+fn send_input_error(events: &broadcast::Sender<TerminalEvent>, error: CommandError) {
+    if !matches!(error, CommandError::Stopped) {
+        send_error(events, error.into());
+    }
 }
 fn pty_size(size: TerminalSize) -> PtySize {
     PtySize {
@@ -2156,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_write_failure_is_correlated_without_an_unsolicited_runtime_error() {
+    fn broken_pipe_input_is_treated_as_a_stopped_terminal() {
         let mut terminal = test_terminal(Box::new(FailingWriter));
         let initial = terminal.snapshot().unwrap();
         let (snapshots, _) = watch::channel(initial);
@@ -2181,10 +2205,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            CommandError::Emulator(message) if message.contains("writing encoded paste to PTY")
-        ));
+        assert!(matches!(&error, CommandError::Stopped));
+        send_input_error(&events, error);
         assert!(matches!(
             event_receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)

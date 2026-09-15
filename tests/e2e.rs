@@ -252,6 +252,29 @@ impl PtyChild {
         .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
     }
 
+    async fn wait_for_screen_without(&mut self, needle: &str) {
+        time::timeout(DEADLINE, async {
+            loop {
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "PTY child exited while waiting for {needle:?} to clear; output={:?}",
+                    self.text()
+                );
+                if !self.screen_text().contains(needle) {
+                    return;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY screen still contained {needle:?}: {:?}",
+                self.screen_text()
+            )
+        });
+    }
+
     async fn send_until(&mut self, input: &[u8], needle: &str) {
         time::timeout(DEADLINE, async {
             while !self.sees(needle) {
@@ -9265,6 +9288,8 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         "clearing attention must not change agent lifecycle state"
     );
     client.send(b"q");
+    client.wait_for_screen_without("• 1").await;
+    client.clear_output();
 
     assert!(matches!(
         harness
@@ -9285,9 +9310,11 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     let read = agent_list();
     assert_eq!(read["result"]["unread_count"], 0);
     assert_eq!(read["result"]["agents"][1]["unread"], false);
+    client.wait_for_screen_without("• 1").await;
 
     client.send(b"\x02:");
     client.wait_for(" commands").await;
+    client.clear_output();
     assert!(matches!(
         harness
             .control_command(ClientMessage::ReportAgent {
@@ -9299,11 +9326,12 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         ServerMessage::CommandCompleted { .. }
     ));
     assert_eq!(agent_list()["result"]["unread_count"], 1);
-    client.clear_output();
+    client.wait_for("• 1").await;
     client.send(b"switch to next alert\r");
     client.wait_for("WAITING").await;
     wait_for(DEADLINE, || agent_list()["result"]["unread_count"] == 0).await;
 
+    client.wait_for_screen_without("• 1").await;
     client.clear_output();
     assert!(matches!(
         harness
@@ -12190,6 +12218,16 @@ async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
     wait_for(DEADLINE, || {
         fs::read_to_string(&log)
             .is_ok_and(|contents| contents.contains("hook=workspace.created label=workspace"))
+    })
+    .await;
+    wait_for(DEADLINE, || {
+        let listed = harness.cli().args(["--json", "list"]).output().unwrap();
+        listed.status.success()
+            && serde_json::from_slice::<Value>(&listed.stdout).is_ok_and(|listed| {
+                listed["result"]["sessions"][0]["workspaces"][0]["tokens"]
+                    ["workspace.extension.rust-status.last_event"]
+                    == "workspace.created"
+            })
     })
     .await;
 
