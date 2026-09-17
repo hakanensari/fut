@@ -48,7 +48,7 @@ pub struct ClientAlertSnapshot {
 
 #[derive(Clone, Debug, Default)]
 struct ClientState {
-    attached: bool,
+    attachments: usize,
     last_used: u64,
     cursors: BTreeMap<TerminalId, AlertCursor>,
 }
@@ -87,7 +87,7 @@ impl AlertStore {
             .map(|(id, state)| (*id, state.cursor()))
             .collect::<Vec<_>>();
         let client = self.clients.entry(client_id).or_default();
-        client.attached = true;
+        client.attachments = client.attachments.saturating_add(1);
         client.last_used = self.revision;
         if is_new {
             client.cursors.extend(current);
@@ -97,7 +97,7 @@ impl AlertStore {
 
     pub fn detach(&mut self, client_id: ClientId) {
         if let Some(client) = self.clients.get_mut(&client_id) {
-            client.attached = false;
+            client.attachments = client.attachments.saturating_sub(1);
             client.last_used = self.revision;
         }
     }
@@ -168,7 +168,7 @@ impl AlertStore {
             let Some(id) = self
                 .clients
                 .iter()
-                .filter(|(_, client)| !client.attached)
+                .filter(|(_, client)| client.attachments == 0)
                 .min_by_key(|(_, client)| client.last_used)
                 .map(|(id, _)| *id)
             else {
@@ -211,6 +211,18 @@ mod tests {
         store.record_bells(terminal, 2, 20);
         store.attach(second);
         assert!(alert(&store, second, terminal).unseen());
+    }
+
+    #[test]
+    fn overlapping_connections_are_reference_counted() {
+        let client = ClientId::new();
+        let mut store = AlertStore::default();
+        store.attach(client);
+        store.attach(client);
+        store.detach(client);
+        assert_eq!(store.clients[&client].attachments, 1);
+        store.detach(client);
+        assert_eq!(store.clients[&client].attachments, 0);
     }
 
     #[test]

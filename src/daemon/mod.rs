@@ -3775,8 +3775,11 @@ async fn control_loop(
 ) -> Result<()> {
     let mut watched_changes: Option<watch::Receiver<u64>> = None;
     let mut watched_presence: Option<watch::Receiver<ClientPresenceSnapshot>> = None;
+    let mut watched_alerts: Option<watch::Receiver<u64>> = None;
+    let mut alert_client_id = None;
     let mut retirement = None;
     let mut prepared_extension_reload: Option<PreparedExtensionReload> = None;
+    let connection_result: Result<()> = async {
     loop {
         let frame = tokio::select! {
             frame = connection.next() => frame,
@@ -3798,6 +3801,16 @@ async fn control_loop(
                     .borrow_and_update()
                     .clone();
                 send(connection, None, ServerMessage::PresenceChanged { presence }).await?;
+                continue;
+            }
+            changed = watched_alert_change(&mut watched_alerts) => {
+                if changed.is_err() {
+                    break;
+                }
+                if let Some(client_id) = alert_client_id {
+                    let snapshot = shared.lock().await.alerts.snapshot(client_id);
+                    send(connection, None, ServerMessage::AlertsChanged { snapshot }).await?;
+                }
                 continue;
             }
         };
@@ -4161,6 +4174,75 @@ async fn control_loop(
                 )
                 .await?;
             }
+            ClientMessage::WatchAlerts { client_id } => {
+                if alert_client_id.is_some() {
+                    send_error(
+                        connection,
+                        envelope.request_id,
+                        "already_watching_alerts",
+                        "this connection already watches alerts",
+                    )
+                    .await?;
+                    continue;
+                }
+                let snapshot = {
+                    let mut state = shared.lock().await;
+                    state.alerts.attach(client_id);
+                    watched_alerts = Some(state.alert_changes.subscribe());
+                    state.alerts.snapshot(client_id)
+                };
+                alert_client_id = Some(client_id);
+                send(
+                    connection,
+                    envelope.request_id,
+                    ServerMessage::AlertsChanged { snapshot },
+                )
+                .await?;
+            }
+            ClientMessage::AcknowledgeAlerts {
+                terminal_id,
+                observed,
+            } => {
+                let Some(client_id) = alert_client_id else {
+                    send_error(
+                        connection,
+                        envelope.request_id,
+                        "alerts_not_watched",
+                        "watch alerts before acknowledging them",
+                    )
+                    .await?;
+                    continue;
+                };
+                let result = {
+                    let mut state = shared.lock().await;
+                    let result = state.alerts.acknowledge(client_id, terminal_id, observed);
+                    if matches!(result, Ok(true)) {
+                        state.publish_alert_change();
+                    }
+                    result
+                };
+                match result {
+                    Ok(_) => {
+                        send(
+                            connection,
+                            envelope.request_id,
+                            ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::AcknowledgeAlerts,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(message) => {
+                        send_error(
+                            connection,
+                            envelope.request_id,
+                            "invalid_alert",
+                            message,
+                        )
+                        .await?
+                    }
+                }
+            }
             ClientMessage::CloseTarget { selector } => {
                 match close_target(&shared, selector, None).await {
                     Ok(_) => {
@@ -4423,9 +4505,7 @@ async fn control_loop(
             | ClientMessage::Paste { .. }
             | ClientMessage::CopyMode { .. }
             | ClientMessage::Resize { .. }
-            | ClientMessage::SelectTarget { .. }
-            | ClientMessage::WatchAlerts { .. }
-            | ClientMessage::AcknowledgeAlerts { .. } => {
+            | ClientMessage::SelectTarget { .. } => {
                 send_error(
                     connection,
                     envelope.request_id,
@@ -4451,6 +4531,12 @@ async fn control_loop(
         tracing::warn!(%error, "workspace retirement failed after acknowledgement");
     }
     Ok(())
+    }
+    .await;
+    if let Some(client_id) = alert_client_id {
+        shared.lock().await.alerts.detach(client_id);
+    }
+    connection_result
 }
 
 async fn handle_contextual_command(

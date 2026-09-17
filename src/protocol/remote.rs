@@ -64,15 +64,17 @@ pub enum Capability {
     Interactive,
     Health,
     Alerts,
+    ControlAlerts,
     ExtensionCatalog,
 }
 
 impl Capability {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Metadata,
         Self::Interactive,
         Self::Health,
         Self::Alerts,
+        Self::ControlAlerts,
         Self::ExtensionCatalog,
     ];
 
@@ -82,6 +84,7 @@ impl Capability {
             Self::Interactive => "interactive.v1",
             Self::Health => "health.v1",
             Self::Alerts => "alerts.v1",
+            Self::ControlAlerts => "control-alerts.v1",
             Self::ExtensionCatalog => "extension-catalog.v1",
         }
     }
@@ -123,7 +126,10 @@ impl Capabilities {
             ListResources | WatchResources => Capability::Metadata,
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
-            WatchAlerts { .. } | AcknowledgeAlerts { .. } => Capability::Alerts,
+            WatchAlerts { .. } | AcknowledgeAlerts { .. } => {
+                return self.contains(Capability::Alerts)
+                    || self.contains(Capability::ControlAlerts);
+            }
             Input { .. }
             | KeyInput { .. }
             | Paste { .. }
@@ -157,10 +163,16 @@ impl Capabilities {
             ExtensionCatalog { .. } | ExtensionCatalogChanged { .. } => {
                 Capability::ExtensionCatalog
             }
-            AlertsChanged { .. } => Capability::Alerts,
+            AlertsChanged { .. } => {
+                return self.contains(Capability::Alerts)
+                    || self.contains(Capability::ControlAlerts);
+            }
             CommandCompleted {
                 command: super::AcknowledgedCommand::AcknowledgeAlerts,
-            } => Capability::Alerts,
+            } => {
+                return self.contains(Capability::Alerts)
+                    || self.contains(Capability::ControlAlerts);
+            }
             CommandCompleted {
                 command:
                     super::AcknowledgedCommand::Input
@@ -195,6 +207,11 @@ impl RemoteHello {
         if matches!(mode, ClientMode::Interactive { .. }) {
             required.push(Capability::Interactive.name().into());
         }
+        let alerts = if matches!(mode, ClientMode::Control) {
+            Capability::ControlAlerts
+        } else {
+            Capability::Alerts
+        };
         Self {
             generation: GENERATION,
             codec: CODEC.into(),
@@ -202,7 +219,7 @@ impl RemoteHello {
             required,
             optional: vec![
                 Capability::Health.name().into(),
-                Capability::Alerts.name().into(),
+                alerts.name().into(),
                 Capability::ExtensionCatalog.name().into(),
             ],
             mode,

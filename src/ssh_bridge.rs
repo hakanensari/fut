@@ -7,6 +7,7 @@ use std::{
     os::unix::net::UnixStream as StdUnixStream,
     path::Path,
     process::Stdio,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
@@ -156,6 +157,7 @@ pub(crate) struct SshBridge {
     // holds its UnixStream. An unnamed socket has no path to leak or unlink.
     socket: StdUnixStream,
     diagnostics: tokio::task::JoinHandle<()>,
+    diagnostic_text: Arc<Mutex<String>>,
 }
 
 impl SshBridge {
@@ -164,7 +166,20 @@ impl SshBridge {
         Self::spawn(&mut command)
     }
 
+    /// Background supervision must never prompt through the user's terminal.
+    pub(crate) fn connect_background(destination: &str) -> Result<(UnixStream, Self)> {
+        let mut command = background_ssh_command(destination)?;
+        Self::spawn_with_diagnostics(&mut command, false)
+    }
+
     fn spawn(command: &mut Command) -> Result<(UnixStream, Self)> {
+        Self::spawn_with_diagnostics(command, true)
+    }
+
+    fn spawn_with_diagnostics(
+        command: &mut Command,
+        echo_diagnostics: bool,
+    ) -> Result<(UnixStream, Self)> {
         let (local, remote) = StdUnixStream::pair().context("create private SSH socket pair")?;
         local.set_nonblocking(true)?;
         let stream = UnixStream::from_std(local.try_clone()?)?;
@@ -176,6 +191,8 @@ impl SshBridge {
             .spawn()
             .context("spawn SSH bridge")?;
         let mut stderr = child.stderr.take().expect("piped SSH stderr");
+        let diagnostic_text = Arc::new(Mutex::new(String::new()));
+        let captured = diagnostic_text.clone();
         let diagnostics = tokio::spawn(async move {
             let mut buffer = [0; 4096];
             while let Ok(count) = stderr.read(&mut buffer).await {
@@ -185,7 +202,16 @@ impl SshBridge {
                 // Remote stderr is not a terminal protocol channel. In particular,
                 // it must not bypass the client's OSC 8 policy or alter tty state.
                 let text = sanitize_diagnostics(&buffer[..count]);
-                let _ = io::stderr().write_all(text.as_bytes());
+                if echo_diagnostics {
+                    let _ = io::stderr().write_all(text.as_bytes());
+                }
+                let mut output = captured.lock().expect("SSH diagnostic lock");
+                for character in text.chars() {
+                    if output.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
+                        break;
+                    }
+                    output.push(character);
+                }
             }
         });
         Ok((
@@ -194,8 +220,23 @@ impl SshBridge {
                 child,
                 socket: local,
                 diagnostics,
+                diagnostic_text,
             },
         ))
+    }
+
+    pub(crate) fn diagnostic(&self) -> String {
+        self.diagnostic_text
+            .lock()
+            .expect("SSH diagnostic lock")
+            .clone()
+    }
+
+    /// Wait for the SSH stderr pipe to close so startup failures can be
+    /// classified from complete diagnostics. A stuck SSH process cannot hold
+    /// endpoint reconnection indefinitely.
+    pub(crate) async fn finish_diagnostics(&mut self, deadline: std::time::Duration) {
+        let _ = tokio::time::timeout(deadline, &mut self.diagnostics).await;
     }
 
     /// Explicit detach: close the attachment, terminate SSH, and reap it before
@@ -213,6 +254,8 @@ impl SshBridge {
         result
     }
 }
+
+const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 impl Drop for SshBridge {
     fn drop(&mut self) {
@@ -270,6 +313,23 @@ fn ssh_command(destination: &str) -> Result<Command> {
     Ok(command)
 }
 
+fn background_ssh_command(destination: &str) -> Result<Command> {
+    validate_destination(destination)?;
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "--",
+        destination,
+        "fut __stdio-bridge",
+    ]);
+    command.kill_on_drop(true);
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +362,20 @@ mod tests {
             assert_eq!(
                 command.as_std().get_args().collect::<Vec<_>>(),
                 ["-T", "--", host, "fut __stdio-bridge"]
+            );
+            let background = background_ssh_command(host).unwrap();
+            assert_eq!(
+                background.as_std().get_args().collect::<Vec<_>>(),
+                [
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "--",
+                    host,
+                    "fut __stdio-bridge",
+                ]
             );
         }
         for invalid in [

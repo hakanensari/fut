@@ -46,6 +46,39 @@ async fn remote_generation_one_supports_unequal_versions_and_optional_omission_o
         );
     }
 
+    let (mut alerts, mut alerts_bridge) = spawn_bridge(&harness.socket);
+    let alerts_offer = RemoteHello::new(ClientMode::Control, "0.2.0");
+    let ServerMessage::RemoteWelcome(alerts_welcome) =
+        remote_hello(&mut alerts, alerts_offer.clone()).await
+    else {
+        panic!()
+    };
+    assert!(
+        alerts_offer
+            .accept(&alerts_welcome)
+            .unwrap()
+            .contains(Capability::ControlAlerts)
+    );
+    assert!(matches!(
+        correlated_command(
+            &mut alerts,
+            ClientMessage::WatchAlerts {
+                client_id: fut::domain::ClientId::new(),
+            },
+        )
+        .await,
+        ServerMessage::AlertsChanged { .. }
+    ));
+    harness.detach(&mut alerts).await;
+    drop(alerts);
+    assert!(
+        time::timeout(DEADLINE, alerts_bridge.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
     for optional in [false, true] {
         let (mut interactive, mut interactive_bridge) = spawn_bridge(&harness.socket);
         let mut offer = RemoteHello::new(interactive_mode(None), "99.123.456");

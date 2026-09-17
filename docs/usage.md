@@ -127,6 +127,16 @@ profile only affects the catalog: the remote daemon and its panes keep running.
 Attaching by saved label is not available yet; pass the SSH target to
 `fut --remote`.
 
+While a local Fut interface is open, it independently watches Local and every
+enabled saved machine for resource, presence, agent, alert, and extension
+metadata. These background connections never request terminal screens or start,
+stop, or upgrade a daemon. Background SSH is non-interactive and requires an
+already trusted host key and non-prompting authentication. Transient disconnects
+retain clearly stale metadata and retry with a capped delay; host-key,
+authentication, installation, and protocol problems wait for interactive repair.
+Changes made with `fut machine enable`, `disable`, `rename`, or `remove` are
+picked up by an open interface without changing its active machine.
+
 For Git repositories, Fut groups linked worktrees from the same repository as
 peer workspaces in one session. Ordinary directories get their own session.
 Opening the same location again reuses it; bare Git repositories are not valid

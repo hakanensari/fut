@@ -12,6 +12,8 @@ pub mod config;
 mod context_menu;
 mod copy_mode;
 mod dialog;
+mod federation;
+mod federation_transport;
 mod fuzzy;
 mod graphics;
 mod hotkey;
@@ -417,6 +419,12 @@ pub async fn attach_navigator(
     let staged = stage_ui_config(config_location)?;
     let (mut navigator_connection, catalog, protocol_version) =
         connect_control_navigator(socket_path, ignore_protocol_mismatch).await?;
+    let alert_client_id = alert_client_id(socket_path)?;
+    let federation = federation::Service::start(socket_path.to_owned(), alert_client_id)?;
+    debug_assert_eq!(
+        federation.snapshot().registry.active(),
+        federation::MachineId::Local
+    );
     let ui = staged.materialize(&catalog)?;
     let (snapshot, presence) =
         match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
@@ -443,6 +451,7 @@ pub async fn attach_navigator(
     let Some(selector) = selector else {
         drop(terminal);
         drop(guard);
+        federation.shutdown().await;
         return Ok(());
     };
 
@@ -453,7 +462,7 @@ pub async fn attach_navigator(
         socket_path,
         Some(selector),
         size,
-        alert_client_id(socket_path)?,
+        alert_client_id,
         protocol_version,
     )
     .await?;
@@ -470,6 +479,7 @@ pub async fn attach_navigator(
         guard.enhanced_keyboard,
     )
     .await;
+    federation.shutdown().await;
     drop(terminal);
     drop(guard);
     result
@@ -654,6 +664,7 @@ pub(crate) async fn attach_with_ui(
 ) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let alert_client_id = alert_client_id(socket_path)?;
+    let federation = federation::Service::start(socket_path.to_owned(), alert_client_id)?;
     let (mut framed, selected, catalog, alerts) = connect_interactive(
         socket_path,
         selector,
@@ -679,6 +690,7 @@ pub(crate) async fn attach_with_ui(
         guard.enhanced_keyboard,
     )
     .await;
+    federation.shutdown().await;
     drop(terminal);
     drop(guard);
     result

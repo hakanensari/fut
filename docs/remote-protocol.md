@@ -23,7 +23,7 @@ the request ID, and unsolicited updates omit it. The current remote client uses
 a fresh ID for the handshake and verifies its echo. The first message is:
 
 ```json
-{"message":{"type":"remote_hello","generation":1,"codec":"msgpack-map-v1","client_version":"0.22.0","required":["metadata.v1"],"optional":["health.v1","alerts.v1","extension-catalog.v1"],"mode":"control"}}
+{"message":{"type":"remote_hello","generation":1,"codec":"msgpack-map-v1","client_version":"0.22.0","required":["metadata.v1"],"optional":["health.v1","control-alerts.v1","extension-catalog.v1"],"mode":"control"}}
 ```
 
 `mode` uses the frozen `ClientMode` payload: `control`, or
@@ -70,7 +70,8 @@ are common to every negotiated connection.
 | `metadata.v1` | `list_resources`, `watch_resources`; resource snapshots/changes and client presence | Required for the navigator and attachment |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
 | `health.v1` | `ping` / `pong` | Machine verification probes health when available and otherwise uses the successful handshake |
-| `alerts.v1` | `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No bell subscription, bell acknowledgements or bell notifications; agent notifications remain available |
+| `alerts.v1` | Interactive `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No attached-terminal bell subscription or acknowledgement |
+| `control-alerts.v1` | Lease-free control `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | Background metadata retains no bell summary; agent summaries remain in resources |
 | `extension-catalog.v1` | Catalog in the welcome; control `get_extension_catalog` and interactive catalog-change notifications | No extension declarations, styles or command listings; related local overrides are ignored |
 
 Interactive resource operations execute **on the daemon's machine**. Paths,
@@ -85,6 +86,19 @@ local renderer; remote catalog validation retains structural/fingerprint checks
 without imposing the local package version on remote declarations.
 No capability in generation 1 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
+
+## Endpoint supervision
+
+The local UI supervises Local and every enabled saved SSH profile independently.
+Background SSH runs non-interactively with strict host-key checking and carries a
+control connection only: resource, presence, agent, alert, and extension metadata,
+never terminal screen frames. Each connection instance has a client-side
+generation, so late events from a replaced socket cannot overwrite its successor.
+Disconnects retain the last complete snapshots as stale and revoke authority to
+send input. Transient failures retry with capped exponential backoff; host-key,
+authentication, installation, and compatibility failures require interactive
+repair. Health uses correlated `ping`/`pong`, or correlated `list_resources` as
+the fallback when `health.v1` is absent.
 
 ## Frozen semantics and evolution
 
