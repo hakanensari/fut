@@ -85,6 +85,36 @@ because they currently assume the client and daemon share a filesystem. Remote
 terminal links are limited to HTTP and HTTPS. Ordinary terminal input,
 navigation, layout actions, copy mode, and pane links continue to work.
 
+### Saved machines
+
+Keep a catalog of the SSH machines you attach to:
+
+```sh
+fut machine add workbox
+fut machine add deploy@10.0.0.7 --label prod
+fut machine list
+fut machine show prod
+fut machine rename prod production
+fut machine disable production
+fut machine enable production
+fut machine remove production
+```
+
+`fut machine add` connects through SSH, confirms that a compatible Fut daemon
+is already running there, and only then saves the profile. A failed or
+cancelled check saves nothing and never changes the terminal. The other
+commands edit the catalog locally and never contact SSH.
+
+A profile holds only a stable ID, a unique label, the SSH target, and whether
+the machine is enabled. Several profiles may point at the same target.
+Passwords, keys, agent sockets, and control sockets stay with OpenSSH, and
+targets that embed a password or use URI syntax are rejected. The catalog is
+the private file `$XDG_STATE_HOME/fut/machines.toml`
+(`~/.local/state/fut/machines.toml` by default). Disabling or removing a
+profile only affects the catalog: the remote daemon and its panes keep running.
+Attaching by saved label is not available yet; pass the SSH target to
+`fut --remote`.
+
 For Git repositories, Fut groups linked worktrees from the same repository as
 peer workspaces in one session. Ordinary directories get their own session.
 Opening the same location again reuses it; bare Git repositories are not valid
@@ -250,6 +280,13 @@ fut extension enable EXTENSION_ID
 fut extension disable EXTENSION_ID
 fut extension remove EXTENSION_ID
 fut extension reload
+fut machine add TARGET [--label LABEL]
+fut machine list
+fut machine show MACHINE
+fut machine rename MACHINE LABEL
+fut machine enable MACHINE
+fut machine disable MACHINE
+fut machine remove MACHINE
 ```
 
 Commands after `--` are passed directly, without shell evaluation. Creation

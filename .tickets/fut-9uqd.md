@@ -1,6 +1,6 @@
 ---
 id: fut-9uqd
-status: open
+status: in_progress
 deps: [fut-62nc]
 links: []
 created: 2026-09-15T13:21:56Z

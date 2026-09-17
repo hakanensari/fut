@@ -1,6 +1,6 @@
 ---
 id: fut-7neq
-status: open
+status: closed
 deps: [fut-62nc]
 links: []
 created: 2026-09-15T13:21:56Z

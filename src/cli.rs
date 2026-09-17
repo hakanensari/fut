@@ -227,6 +227,12 @@ enum Command {
         #[command(subcommand)]
         command: ExtensionCommand,
     },
+    /// Save, inspect, relabel, or forget SSH machines for remote attachment.
+    Machine {
+        /// Machine operation to perform.
+        #[command(subcommand)]
+        command: MachineCommand,
+    },
     /// Publish a declared extension presentation token.
     Token {
         /// Token operation to perform.
@@ -884,6 +890,49 @@ enum ExtensionCommand {
 }
 
 #[derive(Subcommand)]
+enum MachineCommand {
+    /// Confirm a running compatible Fut daemon over SSH, then save the machine.
+    Add {
+        /// Host, SSH config alias, or user@host accepted by OpenSSH.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Unique label for the saved machine; defaults to the target.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// List saved machines without contacting them.
+    #[command(alias = "ls")]
+    List,
+    /// Show one saved machine without contacting it.
+    Show {
+        /// Saved machine label or UUID.
+        machine: String,
+    },
+    /// Relabel a saved machine; its ID and target are unchanged.
+    Rename {
+        /// Saved machine label or UUID.
+        machine: String,
+        /// New unique label.
+        label: String,
+    },
+    /// Include a saved machine in future remote work.
+    Enable {
+        /// Saved machine label or UUID.
+        machine: String,
+    },
+    /// Keep a saved machine but exclude it from future remote work.
+    Disable {
+        /// Saved machine label or UUID.
+        machine: String,
+    },
+    /// Forget a saved machine; its daemon and panes are untouched.
+    Remove {
+        /// Saved machine label or UUID.
+        machine: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TokenCommand {
     /// Materialize unstyled presentation text on one live resource.
     Publish(TokenPublishArgs),
@@ -1133,6 +1182,10 @@ async fn execute(cli: Cli) -> Result<()> {
             }
             ExtensionCommand::List | ExtensionCommand::Show { .. } | ExtensionCommand::Reload => {}
         }
+    }
+
+    if let Some(Command::Machine { command }) = &cli.command {
+        return machine_command(command, cli.json).await;
     }
 
     if let Some(Command::Trust {
@@ -2308,6 +2361,126 @@ async fn trust_status_command(
         human,
     )?;
     Ok(trusted)
+}
+
+/// Only `add` reaches the network, and only to confirm the daemon before
+/// saving. Every other operation is a local catalog edit.
+async fn machine_command(command: &MachineCommand, json_output: bool) -> Result<()> {
+    let catalog = crate::machines::Catalog::resolve()?;
+    let describe = |machine: &crate::machines::Machine| {
+        format!(
+            "{} target={} enabled={} id={}",
+            machine.label, machine.target, machine.enabled, machine.id
+        )
+    };
+    match command {
+        MachineCommand::Add { target, label } => {
+            let label = label.as_deref().unwrap_or(target);
+            catalog.check_new(label, target).map_err(machine_error)?;
+            let (remote_version, machine) = client::cancellable(
+                async {
+                    let remote_version = client::probe_remote(target).await?;
+                    let machine = catalog
+                        .add_async(label, target)
+                        .await
+                        .map_err(machine_error)?;
+                    Ok((remote_version, machine))
+                },
+                "machine setup",
+            )
+            .await?;
+            output(
+                json_output,
+                "machine.add",
+                json!({ "machine": machine, "remote_version": remote_version, "changed": true }),
+                format!(
+                    "added machine {} remote_version={remote_version}",
+                    describe(&machine)
+                ),
+            )
+        }
+        MachineCommand::List => {
+            let machines = catalog.list()?;
+            let human = if machines.is_empty() {
+                "no saved machines".to_owned()
+            } else {
+                machines.iter().map(describe).collect::<Vec<_>>().join("\n")
+            };
+            output(
+                json_output,
+                "machine.list",
+                json!({ "machines": machines, "path": catalog.path() }),
+                human,
+            )
+        }
+        MachineCommand::Show { machine } => {
+            let machine = catalog.find(machine).map_err(machine_error)?;
+            output(
+                json_output,
+                "machine.show",
+                json!({ "machine": machine }),
+                describe(&machine),
+            )
+        }
+        MachineCommand::Rename { machine, label } => {
+            let change = catalog.rename(machine, label).map_err(machine_error)?;
+            output(
+                json_output,
+                "machine.rename",
+                json!({ "machine": change.machine, "changed": change.changed }),
+                format!(
+                    "renamed machine {} changed={}",
+                    describe(&change.machine),
+                    change.changed
+                ),
+            )
+        }
+        MachineCommand::Enable { machine } | MachineCommand::Disable { machine } => {
+            let enabled = matches!(command, MachineCommand::Enable { .. });
+            let change = catalog
+                .set_enabled(machine, enabled)
+                .map_err(machine_error)?;
+            let verb = if enabled { "enabled" } else { "disabled" };
+            output(
+                json_output,
+                if enabled {
+                    "machine.enable"
+                } else {
+                    "machine.disable"
+                },
+                json!({ "machine": change.machine, "changed": change.changed }),
+                format!(
+                    "{verb} machine {} changed={}",
+                    describe(&change.machine),
+                    change.changed
+                ),
+            )
+        }
+        MachineCommand::Remove { machine } => {
+            let machine = catalog.remove(machine).map_err(machine_error)?;
+            output(
+                json_output,
+                "machine.remove",
+                json!({ "machine": machine, "changed": true }),
+                format!(
+                    "removed machine {}\nThe remote daemon and its panes are untouched.",
+                    describe(&machine)
+                ),
+            )
+        }
+    }
+}
+
+fn machine_error(error: crate::machines::Error) -> anyhow::Error {
+    use crate::machines::Error;
+    let message = format!("{error:#}");
+    match error {
+        Error::NotFound(_) => CliError::new("not_found", message).into(),
+        Error::LabelTaken(_) => CliError::new("label_taken", message).into(),
+        Error::Full => CliError::new("catalog_full", message).into(),
+        Error::Invalid(_) => CliError::new("invalid_arguments", message).into(),
+        Error::Other(error) => error,
+    }
 }
 
 fn render_status_error(json_output: bool, error: &anyhow::Error) {
@@ -4552,6 +4725,8 @@ mod tests {
             vec!["trust", "/tmp"],
             vec!["untrust", "/tmp"],
             vec!["extension", "install", "/tmp"],
+            vec!["machine", "list"],
+            vec!["machine", "add", "clonk"],
             vec!["__stdio-bridge"],
             vec!["session", "attach", "name"],
             vec!["--socket", "/tmp/fut.sock"],
@@ -5748,6 +5923,7 @@ mod tests {
                 "terminal",
                 "agent",
                 "extension",
+                "machine",
                 "token",
                 "context",
                 "get",
@@ -5802,6 +5978,17 @@ mod tests {
                 "disable",
                 "remove",
                 "reload"
+            ]
+        );
+        let command = cli_command();
+        let machine = command.find_subcommand("machine").unwrap();
+        assert_eq!(
+            machine
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect::<Vec<_>>(),
+            [
+                "add", "list", "show", "rename", "enable", "disable", "remove"
             ]
         );
         let validate = extension.find_subcommand("validate").unwrap();

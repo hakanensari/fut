@@ -488,9 +488,8 @@ async fn attach_remote_inner(
     host: &str,
     config_location: &config::ConfigLocation,
 ) -> anyhow::Result<()> {
-    let staged = stage_ui_config(config_location)?;
-    let (stream, navigator_bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
-    let navigator = async {
+    let staged = &stage_ui_config(config_location)?;
+    let selector = over_ssh(host, |stream| async move {
         let (mut connection, ui, snapshot, presence) = prepare_remote(async {
             let (mut connection, catalog, _) = handshake_navigator(
                 stream,
@@ -499,7 +498,7 @@ async fn attach_remote_inner(
                 Locality::Remote,
             )
             .await
-            .context("remote attachment failed (SSH or daemon handshake)")?;
+            .context(REMOTE_HANDSHAKE_FAILED)?;
             let ui = staged.materialize(&catalog)?;
             let (snapshot, presence) =
                 match time::timeout(Duration::from_secs(2), receive(&mut connection))
@@ -518,19 +517,15 @@ async fn attach_remote_inner(
         let _guard = TerminalGuard::enter()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         initial_navigator(&mut terminal, &mut connection, snapshot, presence, &ui).await
-    }
-    .await;
-    let cleanup = navigator_bridge.shutdown().await;
-    let selector = navigator?;
-    cleanup?;
+    })
+    .await?;
     let Some(selector) = selector else {
         return Ok(());
     };
 
     // Selection opens a new SSH connection after the navigator's terminal and
     // connection have been dropped, so authentication happens in cooked mode.
-    let (stream, interactive_bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
-    let result = async {
+    over_ssh(host, |stream| async move {
         let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
         let (mut framed, selected, catalog, alerts) = prepare_remote(handshake_interactive(
             stream,
@@ -557,21 +552,61 @@ async fn attach_remote_inner(
             guard.enhanced_keyboard,
         )
         .await
-    }
-    .await;
-    let cleanup = interactive_bridge.shutdown().await;
-    result.and(cleanup)
+    })
+    .await
+}
+
+const REMOTE_HANDSHAKE_FAILED: &str = "remote attachment failed (SSH or daemon handshake)";
+
+/// Confirms that `host` already runs a compatible Fut daemon, reporting its
+/// version. This never touches the terminal, and failure or cancellation still
+/// terminates and reaps SSH. Nothing is started, stopped, or saved here.
+pub async fn probe_remote(host: &str) -> anyhow::Result<String> {
+    over_ssh(host, |stream| {
+        prepare_remote(async {
+            let (_, _, server_version) = hello_control(
+                stream,
+                PROTOCOL_VERSION,
+                Duration::from_secs(60),
+                Locality::Remote,
+            )
+            .await
+            .context(REMOTE_HANDSHAKE_FAILED)?;
+            Ok(server_version)
+        })
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!(one_line_error(&error)))
+}
+
+/// Runs `work` over one fresh SSH bridge, then terminates and reaps SSH
+/// whether or not `work` succeeded.
+async fn over_ssh<T, F>(host: &str, work: impl FnOnce(UnixStream) -> F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let (stream, bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
+    let result = work(stream).await;
+    let cleanup = bridge.shutdown().await;
+    result.and_then(|value| cleanup.map(|()| value))
 }
 
 // Authentication can be slow. Cancellation before terminal setup must still
 // unwind through the bridge owner so its SSH process is killed and reaped.
 async fn prepare_remote<T>(work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    cancellable(work, "remote attachment").await
+}
+
+pub(crate) async fn cancellable<T>(
+    work: impl Future<Output = anyhow::Result<T>>,
+    operation: &str,
+) -> anyhow::Result<T> {
     let mut termination = TerminationSignals::subscribe()?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     tokio::select! {
         result = work => result,
-        name = termination.recv() => bail!("remote attachment terminated by {name}"),
-        _ = interrupt.recv() => bail!("remote attachment interrupted"),
+        name = termination.recv() => bail!("{operation} terminated by {name}"),
+        _ = interrupt.recv() => bail!("{operation} interrupted"),
     }
 }
 
@@ -836,6 +871,28 @@ async fn handshake_navigator(
     crate::protocol::ExtensionCatalog,
     u16,
 )> {
+    let (mut framed, extension_catalog, _) =
+        hello_control(stream, protocol_version, handshake_timeout, locality).await?;
+    send_request(
+        &mut framed,
+        Some(Uuid::new_v4()),
+        ClientMessage::WatchResources,
+    )
+    .await?;
+    Ok((framed, extension_catalog, protocol_version))
+}
+
+/// Control-mode hello, also yielding the daemon's reported Fut version.
+async fn hello_control(
+    stream: UnixStream,
+    protocol_version: u16,
+    handshake_timeout: Duration,
+    locality: Locality,
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    crate::protocol::ExtensionCatalog,
+    String,
+)> {
     let mut framed = Framed::new(stream, codec());
     send(
         &mut framed,
@@ -846,33 +903,36 @@ async fn handshake_navigator(
         },
     )
     .await?;
-    let extension_catalog = match time::timeout(handshake_timeout, receive(&mut framed))
-        .await
-        .context("daemon handshake timed out")??
-    {
-        ServerMessage::Welcome {
-            version,
-            selected: None,
-            extension_catalog,
-            ..
-        } if version == protocol_version => extension_catalog,
-        ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!(ProtocolMismatch {
-                client,
-                server,
-                locality
-            });
-        }
-        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
-        message => bail!("expected control welcome from daemon, received {message:?}"),
-    };
-    send_request(
-        &mut framed,
-        Some(Uuid::new_v4()),
-        ClientMessage::WatchResources,
-    )
-    .await?;
-    Ok((framed, extension_catalog, protocol_version))
+    let (extension_catalog, server_version) =
+        match time::timeout(handshake_timeout, receive(&mut framed))
+            .await
+            .context("daemon handshake timed out")??
+        {
+            ServerMessage::Welcome {
+                version,
+                server_version,
+                selected: None,
+                extension_catalog,
+            } if version == protocol_version => {
+                if server_version.is_empty()
+                    || server_version.len() > 128
+                    || server_version.chars().any(char::is_control)
+                {
+                    bail!("remote daemon reported an invalid version string");
+                }
+                (extension_catalog, server_version)
+            }
+            ServerMessage::IncompatibleProtocol { client, server } => {
+                bail!(ProtocolMismatch {
+                    client,
+                    server,
+                    locality
+                });
+            }
+            ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+            message => bail!("expected control welcome from daemon, received {message:?}"),
+        };
+    Ok((framed, extension_catalog, server_version))
 }
 
 async fn initial_navigator(

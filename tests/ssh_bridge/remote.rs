@@ -370,3 +370,348 @@ fn remote_nested_client_guard_precedes_ssh_attachment() {
         }
     }
 }
+
+fn machine_env(
+    command: &mut Command,
+    root: &std::path::Path,
+    bin: &std::path::Path,
+    socket: &std::path::Path,
+) {
+    remote_env(command, root, bin, socket);
+    command.env("XDG_STATE_HOME", root.join("state"));
+}
+
+fn last_stderr_json(output: &std::process::Output) -> Value {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr.lines().last().unwrap_or_default();
+    serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {stderr}"))
+}
+
+fn machine_catalog(root: &std::path::Path) -> PathBuf {
+    root.join("state/fut/machines.toml")
+}
+
+#[tokio::test]
+async fn machine_add_confirms_the_remote_daemon_then_saves_and_other_commands_stay_local() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let before = harness.resources().await;
+
+    // Verification runs in cooked mode and leaves the terminal untouched.
+    let mut command = Command::new("/usr/bin/script");
+    machine_env(&mut command, root.path(), &bin, &harness.socket);
+    command.args(script_command_args()).arg(
+        r#"
+before=$(stty -g)
+"$FUT_BIN" --no-config machine add clonk --label work
+code=$?
+after=$(stty -g)
+[ "$before" = "$after" ] && printf 'TERM_UNCHANGED\n'
+printf 'MACHINE_EXIT:%s\n' "$code"
+"#,
+    );
+    let mut client = PtyChild::spawn(command);
+    client.wait_success().await;
+    time::timeout(DEADLINE, async {
+        while !client.text().contains("MACHINE_EXIT:") {
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap();
+    let text = client.text();
+    assert!(text.contains("MACHINE_EXIT:0"), "{text}");
+    assert!(text.contains("TERM_UNCHANGED"), "{text}");
+    assert!(!text.contains('\x1b'), "{text}");
+    assert!(
+        text.contains("added machine work target=clonk enabled=true id="),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("remote_version={}", env!("CARGO_PKG_VERSION"))),
+        "{text}"
+    );
+    assert_ssh_reaped(root.path()).await;
+    assert_eq!(
+        fs::read_to_string(root.path().join("ssh-args")).unwrap(),
+        "-T\n--\nclonk\nfut __stdio-bridge\n"
+    );
+    let catalog = machine_catalog(root.path());
+    assert_eq!(
+        fs::metadata(&catalog).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!root.path().join("must-not-be-created").exists());
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(before)
+    );
+
+    // Every other command is a local catalog edit: SSH is unreachable from here.
+    let machine = |arguments: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        machine_env(
+            &mut command,
+            root.path(),
+            &root.path().join("no-ssh-here"),
+            &harness.socket,
+        );
+        command.arg("--json").arg("machine").args(arguments);
+        command.output().unwrap()
+    };
+    let json = |output: std::process::Output, command: &str| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        let value: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["command"], command);
+        value["result"].clone()
+    };
+    let json_error = |output: std::process::Output, code: &str| {
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let value = last_stderr_json(&output);
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["error"]["code"], code, "{value}");
+    };
+
+    json_error(machine(&["add", "clonk", "--label", "work"]), "label_taken");
+    json_error(
+        machine(&["add", "clonk", "--label", "-bad"]),
+        "invalid_arguments",
+    );
+    json_error(
+        machine(&["add", "user:secret@clonk", "--label", "leak"]),
+        "invalid_arguments",
+    );
+    // A second profile for the same target is allowed, but SSH is unavailable
+    // here, so verification fails and nothing is saved.
+    json_error(
+        machine(&["add", "clonk", "--label", "second"]),
+        "command_failed",
+    );
+
+    let list = json(machine(&["list"]), "machine.list");
+    assert_eq!(list["machines"].as_array().unwrap().len(), 1);
+    assert!(
+        list["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("state/fut/machines.toml")
+    );
+    let saved = &list["machines"][0];
+    let id = Uuid::parse_str(saved["id"].as_str().unwrap()).unwrap();
+    assert_eq!(saved["label"], "work");
+    assert_eq!(saved["target"], "clonk");
+    assert_eq!(saved["enabled"], true);
+    assert_eq!(saved.as_object().unwrap().len(), 4, "{saved}");
+
+    let shown = json(machine(&["show", &id.to_string()]), "machine.show");
+    assert_eq!(shown["machine"], *saved);
+    let renamed = json(machine(&["rename", "work", "office"]), "machine.rename");
+    assert_eq!(renamed["changed"], true);
+    assert_eq!(renamed["machine"]["id"], id.to_string());
+    assert_eq!(renamed["machine"]["label"], "office");
+    json_error(machine(&["show", "work"]), "not_found");
+    let disabled = json(machine(&["disable", "office"]), "machine.disable");
+    assert_eq!(disabled["changed"], true);
+    assert_eq!(disabled["machine"]["enabled"], false);
+    assert_eq!(
+        json(machine(&["disable", "office"]), "machine.disable")["changed"],
+        false
+    );
+    let enabled = json(machine(&["enable", &id.to_string()]), "machine.enable");
+    assert_eq!(enabled["changed"], true);
+    assert_eq!(enabled["machine"]["enabled"], true);
+    let removed = json(machine(&["remove", "office"]), "machine.remove");
+    assert_eq!(removed["machine"]["id"], id.to_string());
+    json_error(machine(&["remove", "office"]), "not_found");
+    assert_eq!(
+        json(machine(&["list"]), "machine.list")["machines"],
+        Value::Array(Vec::new())
+    );
+
+    let text = fs::read_to_string(&catalog).unwrap();
+    assert!(text.starts_with("version = 1"), "{text}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "only the verified add may use SSH"
+    );
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
+    // SSH failures and a missing remote daemon.
+    for failure in [
+        Some("Permission denied (publickey)."),
+        Some("fut: command not found"),
+        None,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = fake_ssh(root.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        machine_env(
+            &mut command,
+            root.path(),
+            &bin,
+            &root.path().join("missing.sock"),
+        );
+        let output = command
+            .env("SSH_FAILURE", failure.unwrap_or_default())
+            .args(["--json", "--no-config", "machine", "add", "clonk"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        // SSH's own diagnostics pass through ahead of the error envelope.
+        let error = last_stderr_json(&output);
+        assert_eq!(error["error"]["code"], "command_failed");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("remote attachment failed"), "{message}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(failure.unwrap_or("connect bridge to")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains('\x1b'));
+        assert!(!machine_catalog(root.path()).exists());
+        assert!(!root.path().join("state").exists());
+        assert_ssh_reaped(root.path()).await;
+    }
+
+    // An incompatible daemon.
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = root.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = Connection::new(stream);
+        let hello: Envelope<ClientMessage> =
+            decode_payload(&connection.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(
+            hello.message,
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                mode: ClientMode::Control,
+                ..
+            }
+        ));
+        connection
+            .send(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: hello.request_id,
+                    message: ServerMessage::IncompatibleProtocol {
+                        client: PROTOCOL_VERSION,
+                        server: PROTOCOL_VERSION + 1,
+                    },
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(connection.next().await.is_none());
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+    machine_env(&mut command, root.path(), &bin, &socket);
+    command.args(["--no-config", "machine", "add", "clonk"]);
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("incompatible protocol"), "{error}");
+    assert!(error.contains("install a matching Fut version"), "{error}");
+    assert!(!machine_catalog(root.path()).exists());
+    assert_ssh_reaped(root.path()).await;
+    server.await.unwrap();
+
+    // Cancellation while SSH is still authenticating.
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+    machine_env(
+        &mut command,
+        root.path(),
+        &bin,
+        &root.path().join("unused.sock"),
+    );
+    command
+        .env("SSH_STALL", "1")
+        .args(["--no-config", "machine", "add", "clonk"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    wait_for_nonempty_file(&root.path().join("ssh-pids")).await;
+    // SAFETY: this PID belongs to the child created above.
+    assert_eq!(unsafe { libc::kill(child.id() as _, libc::SIGTERM) }, 0);
+    let output = time::timeout(
+        DEADLINE,
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("terminated by SIGTERM"));
+    assert!(!machine_catalog(root.path()).exists());
+    assert_ssh_reaped(root.path()).await;
+
+    // Cancellation while waiting for a concurrent catalog writer must not
+    // cross the catalog commit point after remote verification succeeds.
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let catalog = machine_catalog(root.path());
+    fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+    let lock_path = catalog.with_extension("lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .unwrap();
+    // SAFETY: lock owns this descriptor until after the child exits.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+    machine_env(&mut command, root.path(), &bin, &harness.socket);
+    command
+        .args(["--no-config", "machine", "add", "clonk"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    wait_for_nonempty_file(&root.path().join("ssh-pids")).await;
+    assert_ssh_reaped(root.path()).await;
+    // SAFETY: this PID belongs to the child created above.
+    assert_eq!(unsafe { libc::kill(child.id() as _, libc::SIGTERM) }, 0);
+    let output = time::timeout(
+        DEADLINE,
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("machine setup terminated"));
+    assert!(!catalog.exists());
+    drop(lock);
+    harness.shutdown().await;
+}

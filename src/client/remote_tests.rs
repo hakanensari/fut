@@ -270,6 +270,45 @@ fn remote_link_policy_applies_at_rendering_and_preserves_local_links() {
 }
 
 #[tokio::test]
+async fn remote_control_rejects_unsafe_daemon_version_text() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let server = tokio::spawn(async move {
+        let mut peer = Framed::new(peer, codec());
+        let hello: Envelope<ClientMessage> =
+            decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+        peer.send(Bytes::from(
+            encode_payload(&Envelope {
+                request_id: hello.request_id,
+                message: ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    server_version: "0.22.0\u{1b}[2J".into(),
+                    selected: None,
+                    extension_catalog: crate::protocol::ExtensionCatalog {
+                        generation: 1,
+                        fingerprint: String::new(),
+                        extensions: Vec::new(),
+                        config: Default::default(),
+                    },
+                },
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    });
+    let error = hello_control(
+        stream,
+        PROTOCOL_VERSION,
+        Duration::from_secs(1),
+        Locality::Remote,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid version string"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn handshakes_reject_mismatch_with_locality_specific_guidance() {
     for locality in [Locality::Local, Locality::Remote] {
         for interactive in [false, true] {

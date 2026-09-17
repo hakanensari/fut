@@ -229,15 +229,33 @@ fn sanitize_diagnostics(bytes: &[u8]) -> String {
         .collect()
 }
 
+pub(crate) const MAX_DESTINATION_BYTES: usize = 256;
+
+/// Accepts what OpenSSH resolves itself: a host, alias, or `user@host`.
+/// Anything that could carry a secret or be misread as an option is rejected.
 pub(crate) fn validate_destination(destination: &str) -> Result<()> {
-    if destination.is_empty()
-        || destination.starts_with('-')
-        || destination.chars().any(char::is_whitespace)
-        || destination.contains('\0')
+    if destination.is_empty() || destination.len() > MAX_DESTINATION_BYTES {
+        bail!("SSH destination must be 1 to {MAX_DESTINATION_BYTES} bytes");
+    }
+    if destination
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
     {
-        bail!(
-            "SSH destination must be a nonempty host or config alias, without whitespace or a leading dash"
-        );
+        bail!("SSH destination must not contain whitespace or control characters");
+    }
+    if destination.starts_with('-') {
+        bail!("SSH destination must not start with a dash");
+    }
+    if destination.contains("://") {
+        bail!("SSH destination must be a host or config alias, not a URI");
+    }
+    if let Some((user, host)) = destination.rsplit_once('@') {
+        if user.is_empty() || host.is_empty() || user.contains('@') {
+            bail!("SSH destination must contain a valid user@host pair");
+        }
+        if user.contains(':') {
+            bail!("SSH destination must not embed a password");
+        }
     }
     Ok(())
 }
@@ -292,9 +310,14 @@ mod tests {
             "two hosts",
             "host\ncommand",
             "host\0",
+            "host\x1b[2J",
+            "ssh://user@host:22",
+            "user:password@host",
+            &"h".repeat(MAX_DESTINATION_BYTES + 1),
         ] {
-            assert!(ssh_command(invalid).is_err());
+            assert!(ssh_command(invalid).is_err(), "{invalid:?}");
         }
+        assert!(ssh_command("hôte").is_ok());
     }
 
     #[tokio::test]

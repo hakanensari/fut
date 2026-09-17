@@ -2,19 +2,15 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    env, fs,
-    io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{OpenOptionsExt, PermissionsExt},
-    },
+    fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::{
     client::config::{
@@ -178,51 +174,6 @@ impl TrustStore {
         self.recipes
             .iter()
             .any(|recipe| recipe.path == path && recipe.sha256 == digest)
-    }
-}
-
-struct TrustStoreLock {
-    _file: fs::File,
-}
-
-impl TrustStoreLock {
-    fn acquire(store_path: &Path) -> Result<Self> {
-        prepare_store_parent(store_path)?;
-        let lock_path = store_path.with_file_name("trusted-recipes.lock");
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
-            .with_context(|| format!("open project recipe trust lock {}", lock_path.display()))?;
-        if !file
-            .metadata()
-            .with_context(|| format!("inspect project recipe trust lock {}", lock_path.display()))?
-            .file_type()
-            .is_file()
-        {
-            bail!(
-                "project recipe trust lock {} is not a regular file",
-                lock_path.display()
-            );
-        }
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("secure project recipe trust lock {}", lock_path.display()))?;
-        loop {
-            // SAFETY: `file` owns a valid descriptor and `LOCK_EX` has no pointer arguments.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error).with_context(|| {
-                    format!("lock project recipe trust store {}", store_path.display())
-                });
-            }
-        }
-        Ok(Self { _file: file })
     }
 }
 
@@ -585,7 +536,7 @@ fn parse_recipe_ref(file: &RecipeFile, extensions: &[Extension]) -> Result<Works
 
 fn trust_at(state_path: &Path, file: RecipeFile) -> Result<RecipeTrustChange> {
     let source = storable_path(&file.source)?.to_owned();
-    let _lock = TrustStoreLock::acquire(state_path)?;
+    let _lock = crate::state_file::Lock::acquire(state_path)?;
     let mut store = read_trust_store(state_path)?;
     let existing = store
         .recipes
@@ -627,7 +578,7 @@ fn trust_at(state_path: &Path, file: RecipeFile) -> Result<RecipeTrustChange> {
 
 fn untrust_at(state_path: &Path, source: PathBuf) -> Result<RecipeTrustChange> {
     let source_string = storable_path(&source)?;
-    let _lock = TrustStoreLock::acquire(state_path)?;
+    let _lock = crate::state_file::Lock::acquire(state_path)?;
     let mut store = read_trust_store(state_path)?;
     let mut removed_digest = None;
     store.recipes.retain(|recipe| {
@@ -672,85 +623,16 @@ fn canonical_repository_recipe_path(project: &ProjectConfig) -> Result<PathBuf> 
 }
 
 pub(crate) fn trust_store_path() -> Result<PathBuf> {
-    trust_store_path_from(
-        env::var_os("XDG_STATE_HOME").as_deref(),
-        env::var_os("HOME").as_deref(),
-    )
-}
-
-fn trust_store_path_from(
-    xdg_state_home: Option<&std::ffi::OsStr>,
-    home: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
-    if let Some(directory) = xdg_state_home.filter(|value| !value.is_empty()) {
-        let directory = PathBuf::from(directory);
-        if !directory.is_absolute() {
-            bail!(
-                "XDG_STATE_HOME must be an absolute path when resolving project recipe trust state"
-            );
-        }
-        return Ok(directory.join("fut/trusted-recipes.toml"));
-    }
-    let home = home
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .context("HOME must be set when XDG_STATE_HOME is not set")?;
-    if !home.is_absolute() {
-        bail!("HOME must be an absolute path when resolving project recipe trust state");
-    }
-    Ok(home.join(".local/state/fut/trusted-recipes.toml"))
+    crate::state_file::path("trusted-recipes.toml")
 }
 
 fn read_trust_store(path: &Path) -> Result<TrustStore> {
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TrustStore::empty());
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read project recipe trust store {}", path.display()));
-        }
+    let Some(text) = crate::state_file::read(path, MAX_TRUST_STORE_BYTES)
+        .with_context(|| format!("read project recipe trust store {}", path.display()))?
+    else {
+        return Ok(TrustStore::empty());
     };
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect project recipe trust store {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!(
-            "project recipe trust store {} is not a regular file",
-            path.display()
-        );
-    }
-    if metadata.permissions().mode() & 0o7777 != 0o600 {
-        bail!(
-            "project recipe trust store {} must have permissions 0600",
-            path.display()
-        );
-    }
-    if metadata.len() > MAX_TRUST_STORE_BYTES {
-        bail!(
-            "project recipe trust store {} is {} bytes; maximum is {MAX_TRUST_STORE_BYTES}",
-            path.display(),
-            metadata.len()
-        );
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_TRUST_STORE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read project recipe trust store {}", path.display()))?;
-    if bytes.len() as u64 > MAX_TRUST_STORE_BYTES {
-        bail!(
-            "project recipe trust store {} exceeds the {MAX_TRUST_STORE_BYTES}-byte maximum",
-            path.display()
-        );
-    }
-    let text = std::str::from_utf8(&bytes)
-        .with_context(|| format!("project recipe trust store {} is not UTF-8", path.display()))?;
-    let store = toml::from_str::<TrustStore>(text)
+    let store = toml::from_str::<TrustStore>(&text)
         .with_context(|| format!("parse project recipe trust store {}", path.display()))?;
     validate_trust_store(&store)
         .with_context(|| format!("validate project recipe trust store {}", path.display()))?;
@@ -791,103 +673,10 @@ fn validate_trust_store(store: &TrustStore) -> Result<()> {
     Ok(())
 }
 
-fn prepare_store_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .context("project recipe trust store path must have a parent directory")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create project recipe trust store directory {}",
-            parent.display()
-        )
-    })?;
-    let metadata = fs::symlink_metadata(parent).with_context(|| {
-        format!(
-            "inspect project recipe trust store directory {}",
-            parent.display()
-        )
-    })?;
-    if !metadata.file_type().is_dir() {
-        bail!(
-            "project recipe trust store directory {} is not a directory",
-            parent.display()
-        );
-    }
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
-        format!(
-            "secure project recipe trust store directory {}",
-            parent.display()
-        )
-    })?;
-    Ok(())
-}
-
 fn write_trust_store(path: &Path, store: &TrustStore) -> Result<()> {
-    prepare_store_parent(path)?;
     let contents = toml::to_string_pretty(store).context("serialize project recipe trust store")?;
-    if contents.len() as u64 > MAX_TRUST_STORE_BYTES {
-        bail!(
-            "updated project recipe trust store exceeds the {MAX_TRUST_STORE_BYTES}-byte maximum"
-        );
-    }
-    let parent = path
-        .parent()
-        .expect("validated project recipe trust store parent");
-    let temporary_path = parent.join(format!(".trusted-recipes.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut temporary = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary_path)
-            .with_context(|| {
-                format!(
-                    "create temporary project recipe trust store {}",
-                    temporary_path.display()
-                )
-            })?;
-        temporary
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "secure temporary project recipe trust store {}",
-                    temporary_path.display()
-                )
-            })?;
-        temporary.write_all(contents.as_bytes()).with_context(|| {
-            format!(
-                "write temporary project recipe trust store {}",
-                temporary_path.display()
-            )
-        })?;
-        temporary.sync_all().with_context(|| {
-            format!(
-                "sync temporary project recipe trust store {}",
-                temporary_path.display()
-            )
-        })?;
-        fs::rename(&temporary_path, path).with_context(|| {
-            format!(
-                "atomically replace project recipe trust store {}",
-                path.display()
-            )
-        })?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| {
-                format!(
-                    "sync project recipe trust store directory {}",
-                    parent.display()
-                )
-            })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+    crate::state_file::write(path, &contents, MAX_TRUST_STORE_BYTES)
+        .with_context(|| format!("write project recipe trust store {}", path.display()))
 }
 
 fn storable_path(path: &Path) -> Result<&str> {
@@ -1062,6 +851,8 @@ fn validate_environment(environment: &BTreeMap<String, String>, path: &str) -> R
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn parse(source: &str) -> Result<WorkspaceRecipe> {
@@ -1355,28 +1146,5 @@ workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
 
         assert!(trust_with_store(&project, &[], Some(&state_path), None).is_err());
         assert!(!state_path.exists());
-    }
-
-    #[test]
-    fn trust_store_location_prefers_valid_xdg_and_validates_fallback_home() {
-        assert_eq!(
-            trust_store_path_from(Some(Path::new("/state").as_os_str()), None).unwrap(),
-            Path::new("/state/fut/trusted-recipes.toml")
-        );
-        assert_eq!(
-            trust_store_path_from(None, Some(Path::new("/home/user").as_os_str())).unwrap(),
-            Path::new("/home/user/.local/state/fut/trusted-recipes.toml")
-        );
-        assert_eq!(
-            trust_store_path_from(
-                Some(std::ffi::OsStr::new("")),
-                Some(Path::new("/home/user").as_os_str())
-            )
-            .unwrap(),
-            Path::new("/home/user/.local/state/fut/trusted-recipes.toml")
-        );
-        assert!(trust_store_path_from(Some(Path::new("relative").as_os_str()), None).is_err());
-        assert!(trust_store_path_from(None, Some(Path::new("relative").as_os_str())).is_err());
-        assert!(trust_store_path_from(None, None).is_err());
     }
 }
