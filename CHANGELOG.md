@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.24
+
 - Fixed shell redraws, including zsh autosuggestions, by advertising a portable terminal type inside Fut.
 
 ## 0.23
