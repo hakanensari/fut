@@ -1,4 +1,5 @@
 use super::*;
+use fut::protocol::remote::{self as wire, EndpointError, RemoteHello};
 
 fn fake_ssh(root: &std::path::Path) -> PathBuf {
     let bin = root.join("fake-bin");
@@ -122,6 +123,90 @@ argv = ["./run"]
 }
 
 #[tokio::test]
+async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capabilities() {
+    let harness = Harness::start("printf 'OPTIONAL_READY\\r\\n'; while IFS= read -r line; do printf 'OPTIONAL:%s\\r\\n' \"$line\"; done").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = root.path().join("compatible-peer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let daemon_socket = harness.socket.clone();
+    // Simulate a generation-1 implementation from another package release
+    // which implements only the required capabilities. The real SSH bridge
+    // still forwards opaque bytes; this shim exists only in the test peer.
+    let peer = tokio::spawn(async move {
+        for interactive in [false, true] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut client = Framed::new(stream, codec());
+            let mut daemon =
+                Framed::new(UnixStream::connect(&daemon_socket).await.unwrap(), codec());
+            let mut hello: Envelope<ClientMessage> =
+                decode_payload(&client.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::RemoteHello(offer) = &mut hello.message else {
+                panic!("expected remote hello")
+            };
+            assert_eq!(
+                matches!(offer.mode, ClientMode::Interactive { .. }),
+                interactive
+            );
+            offer.client_version = "0.1.0".into();
+            offer.optional.clear();
+            daemon
+                .send(Bytes::from(encode_payload(&hello).unwrap()))
+                .await
+                .unwrap();
+            let mut welcome: Envelope<ServerMessage> =
+                decode_payload(&daemon.next().await.unwrap().unwrap()).unwrap();
+            let ServerMessage::RemoteWelcome(selected) = &mut welcome.message else {
+                panic!("expected remote welcome")
+            };
+            selected.server_version = "0.999.0".into();
+            assert!(selected.extension_catalog.is_none());
+            client
+                .send(Bytes::from(encode_payload(&welcome).unwrap()))
+                .await
+                .unwrap();
+            loop {
+                tokio::select! {
+                    frame = client.next() => {
+                        let Some(Ok(frame)) = frame else { break };
+                        let message: Envelope<ClientMessage> = decode_payload(&frame).unwrap();
+                        assert!(!matches!(message.message, ClientMessage::WatchAlerts { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::Ping));
+                        daemon.send(frame.freeze()).await.unwrap();
+                    }
+                    frame = daemon.next() => {
+                        let Some(Ok(frame)) = frame else { break };
+                        if client.send(frame.freeze()).await.is_err() { break; }
+                    }
+                }
+            }
+        }
+    });
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &socket);
+    command
+        .args(script_command_args())
+        .arg("stty cols 80 rows 24; exec \"$FUT_BIN\" --no-config --remote clonk");
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("navigator").await;
+    client.send(b"\r");
+    client.wait_for("OPTIONAL_READY").await;
+    client.send(b"ping\r");
+    client.wait_for("OPTIONAL:ping").await;
+    client.send(b"\x02S");
+    client.wait_for("project opener unavailable").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    assert!(!root.path().join("must-not-be-created").exists());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn remote_failures_leave_terminal_untouched_and_reap_ssh() {
     for failure in [
         "Permission denied (publickey).",
@@ -208,19 +293,21 @@ async fn remote_cli_protocol_mismatch_never_retries_or_changes_terminal() {
         let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
         assert!(matches!(
             hello.message,
-            ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
+            ClientMessage::RemoteHello(RemoteHello {
+                generation: wire::GENERATION,
                 mode: ClientMode::Control,
                 ..
-            }
+            })
         ));
         connection
             .send(Bytes::from(
                 encode_payload(&Envelope {
                     request_id: hello.request_id,
-                    message: ServerMessage::IncompatibleProtocol {
-                        client: PROTOCOL_VERSION,
-                        server: PROTOCOL_VERSION - 1,
+                    message: ServerMessage::EndpointError {
+                        error: EndpointError::IncompatibleGeneration {
+                            client: wire::GENERATION,
+                            server: wire::GENERATION + 1,
+                        },
                     },
                 })
                 .unwrap(),
@@ -243,9 +330,7 @@ async fn remote_cli_protocol_mismatch_never_retries_or_changes_terminal() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("incompatible protocol"), "{error}");
-    assert!(error.contains("install a matching Fut version"), "{error}");
-    assert!(error.contains("remote daemon"), "{error}");
+    assert!(error.contains("incompatible remote generation"), "{error}");
     assert!(!error.contains("shutdown"));
     assert!(!error.contains('\x1b'));
     assert_ssh_reaped(root.path()).await;
@@ -555,6 +640,59 @@ printf 'MACHINE_EXIT:%s\n' "$code"
 }
 
 #[tokio::test]
+async fn machine_add_accepts_an_unequal_version_without_optional_health_checks() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = root.path().join("compatible-peer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = Connection::new(stream);
+        let hello: Envelope<ClientMessage> =
+            decode_payload(&connection.next().await.unwrap().unwrap()).unwrap();
+        let ClientMessage::RemoteHello(offer) = hello.message else {
+            panic!("expected remote hello")
+        };
+        connection
+            .send(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: hello.request_id,
+                    message: ServerMessage::RemoteWelcome(wire::RemoteWelcome {
+                        generation: wire::GENERATION,
+                        codec: wire::CODEC.into(),
+                        server_version: "0.999.0".into(),
+                        capabilities: offer.required,
+                        selected: None,
+                        extension_catalog: None,
+                    }),
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            connection.next().await.is_none(),
+            "unsupported optional health method was sent"
+        );
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+    machine_env(&mut command, root.path(), &bin, &socket);
+    command.args(["--json", "--no-config", "machine", "add", "clonk"]);
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0.999.0"));
+    assert!(machine_catalog(root.path()).exists());
+    assert_ssh_reaped(root.path()).await;
+    peer.await.unwrap();
+}
+
+#[tokio::test]
 async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
     // SSH failures and a missing remote daemon.
     for failure in [
@@ -606,19 +744,21 @@ async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
             decode_payload(&connection.next().await.unwrap().unwrap()).unwrap();
         assert!(matches!(
             hello.message,
-            ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
+            ClientMessage::RemoteHello(RemoteHello {
+                generation: wire::GENERATION,
                 mode: ClientMode::Control,
                 ..
-            }
+            })
         ));
         connection
             .send(Bytes::from(
                 encode_payload(&Envelope {
                     request_id: hello.request_id,
-                    message: ServerMessage::IncompatibleProtocol {
-                        client: PROTOCOL_VERSION,
-                        server: PROTOCOL_VERSION + 1,
+                    message: ServerMessage::EndpointError {
+                        error: EndpointError::IncompatibleGeneration {
+                            client: wire::GENERATION,
+                            server: wire::GENERATION + 1,
+                        },
                     },
                 })
                 .unwrap(),
@@ -635,8 +775,7 @@ async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("incompatible protocol"), "{error}");
-    assert!(error.contains("install a matching Fut version"), "{error}");
+    assert!(error.contains("incompatible remote generation"), "{error}");
     assert!(!machine_catalog(root.path()).exists());
     assert_ssh_reaped(root.path()).await;
     server.await.unwrap();

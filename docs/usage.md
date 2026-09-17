@@ -67,8 +67,11 @@ The local process renders the interface and uses the local theme, keybindings,
 and clipboard; SSH carries the Fut protocol to the remote daemon without
 exposing a network listener.
 
-The same Fut version must already be installed on the remote host and its daemon
-must already be running. For example, connect normally once, start Fut, and
+Fut must already be installed on the remote host and its daemon must already be
+running. The client and daemon may use different Fut versions when they support
+the same remote protocol generation, codec, and required capabilities. Older
+releases without the remote handshake need upgrading before remote attachment
+can work. For example, connect normally once, start Fut, and
 detach before using the local client:
 
 ```sh
@@ -84,6 +87,15 @@ commands, extension command actions, and client lifecycle hooks are unavailable
 because they currently assume the client and daemon share a filesystem. Remote
 terminal links are limited to HTTP and HTTPS. Ordinary terminal input,
 navigation, layout actions, copy mode, and pane links continue to work.
+
+The navigator requires metadata support, and attachment additionally requires
+interactive terminal support. Bell alerts, extension catalogs, and health checks
+are optional: a peer without one of these disables only that feature. A missing
+extension catalog also disables its presentation styles and command listings;
+local theme and ordinary keybindings still work. An incompatible or malformed
+endpoint fails without restarting either daemon or retrying the private local
+protocol. The local exact-version check and `--ignore-protocol-mismatch` escape
+hatch are unchanged. See the [remote protocol contract](remote-protocol.md).
 
 ### Saved machines
 

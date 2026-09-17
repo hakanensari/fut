@@ -24,6 +24,7 @@ mod notifications;
 mod perf;
 mod presentation;
 mod project_opener;
+mod remote;
 #[cfg(test)]
 mod remote_tests;
 mod rename;
@@ -435,6 +436,7 @@ pub async fn attach_navigator(
         snapshot,
         presence,
         &ui,
+        None,
     )
     .await?;
     drop(navigator_connection);
@@ -481,7 +483,7 @@ pub async fn attach_remote(
 ) -> anyhow::Result<()> {
     attach_remote_inner(host, config_location)
         .await
-        .map_err(|error| anyhow::anyhow!(one_line_error(&error)))
+        .map_err(remote::report_error)
 }
 
 async fn attach_remote_inner(
@@ -490,16 +492,12 @@ async fn attach_remote_inner(
 ) -> anyhow::Result<()> {
     let staged = &stage_ui_config(config_location)?;
     let selector = over_ssh(host, |stream| async move {
-        let (mut connection, ui, snapshot, presence) = prepare_remote(async {
-            let (mut connection, catalog, _) = handshake_navigator(
-                stream,
-                PROTOCOL_VERSION,
-                Duration::from_secs(60),
-                Locality::Remote,
-            )
-            .await
-            .context(REMOTE_HANDSHAKE_FAILED)?;
-            let ui = staged.materialize(&catalog)?;
+        let (mut connection, ui, snapshot, presence, capabilities) = prepare_remote(async {
+            let remote = remote::navigator(stream, Duration::from_secs(60))
+                .await
+                .context(REMOTE_HANDSHAKE_FAILED)?;
+            let ui = remote::materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
+            let mut connection = remote.framed;
             let (snapshot, presence) =
                 match time::timeout(Duration::from_secs(2), receive(&mut connection))
                     .await
@@ -509,14 +507,23 @@ async fn attach_remote_inner(
                     ServerMessage::Error { code, message } => {
                         bail!("remote daemon error ({code}): {message}")
                     }
+                    ServerMessage::EndpointError { error } => return Err(error.into()),
                     _ => bail!("expected resources from remote daemon"),
                 };
-            Ok((connection, ui, snapshot, presence))
+            Ok((connection, ui, snapshot, presence, remote.capabilities))
         })
         .await?;
         let _guard = TerminalGuard::enter()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        initial_navigator(&mut terminal, &mut connection, snapshot, presence, &ui).await
+        initial_navigator(
+            &mut terminal,
+            &mut connection,
+            snapshot,
+            presence,
+            &ui,
+            Some(capabilities),
+        )
+        .await
     })
     .await?;
     let Some(selector) = selector else {
@@ -527,27 +534,35 @@ async fn attach_remote_inner(
     // connection have been dropped, so authentication happens in cooked mode.
     over_ssh(host, |stream| async move {
         let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
-        let (mut framed, selected, catalog, alerts) = prepare_remote(handshake_interactive(
+        let remote = prepare_remote(remote::interactive(
             stream,
-            Some(selector),
+            selector,
             TerminalSize { columns, rows },
-            crate::domain::ClientId::new(),
-            PROTOCOL_VERSION,
             Duration::from_secs(60),
-            Locality::Remote,
         ))
-        .await?;
-        let ui = staged.materialize(&catalog)?;
+        .await
+        .context(REMOTE_HANDSHAKE_FAILED)?;
+        let ui = remote::materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
+        let generation = remote
+            .welcome
+            .extension_catalog
+            .as_ref()
+            .map_or(0, |catalog| catalog.generation);
+        let selected = remote
+            .welcome
+            .selected
+            .expect("validated interactive welcome");
+        let mut framed = remote.framed;
         let guard = TerminalGuard::enter()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         run(
             &mut terminal,
             &mut framed,
             selected,
-            alerts,
+            crate::alerts::ClientAlertSnapshot::default(),
             ui,
-            catalog.generation,
-            Attachment::Remote,
+            generation,
+            Attachment::Remote(remote.capabilities),
             config_location,
             guard.enhanced_keyboard,
         )
@@ -564,19 +579,34 @@ const REMOTE_HANDSHAKE_FAILED: &str = "remote attachment failed (SSH or daemon h
 pub async fn probe_remote(host: &str) -> anyhow::Result<String> {
     over_ssh(host, |stream| {
         prepare_remote(async {
-            let (_, _, server_version) = hello_control(
+            let mut remote = remote::negotiate(
                 stream,
-                PROTOCOL_VERSION,
+                ClientMode::Control,
+                env!("CARGO_PKG_VERSION"),
                 Duration::from_secs(60),
-                Locality::Remote,
             )
             .await
             .context(REMOTE_HANDSHAKE_FAILED)?;
+            if remote
+                .capabilities
+                .contains(crate::protocol::remote::Capability::Health)
+            {
+                send(&mut remote.framed, ClientMessage::Ping).await?;
+                if !matches!(
+                    time::timeout(Duration::from_secs(2), receive(&mut remote.framed))
+                        .await
+                        .context("remote health check timed out")??,
+                    ServerMessage::Pong { .. }
+                ) {
+                    return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
+                }
+            }
+            let server_version = remote.welcome.server_version;
             Ok(server_version)
         })
     })
     .await
-    .map_err(|error| anyhow::anyhow!(one_line_error(&error)))
+    .map_err(remote::report_error)
 }
 
 /// Runs `work` over one fresh SSH bridge, then terminates and reaps SSH
@@ -733,7 +763,6 @@ async fn connect_interactive(
         alert_client_id,
         protocol_version,
         Duration::from_secs(2),
-        Locality::Local,
     )
     .await
 }
@@ -745,7 +774,6 @@ async fn handshake_interactive(
     alert_client_id: crate::domain::ClientId,
     protocol_version: u16,
     handshake_timeout: Duration,
-    locality: Locality,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     SelectedView,
@@ -777,11 +805,7 @@ async fn handshake_interactive(
             bail!("daemon welcomed client with unsupported protocol version {version}")
         }
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!(ProtocolMismatch {
-                client,
-                server,
-                locality
-            })
+            bail!(ProtocolMismatch { client, server })
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
@@ -823,22 +847,12 @@ async fn connect_control_navigator(
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("incompatible protocol: client {client}, server {server}; {}", self.guidance())]
+#[error(
+    "incompatible protocol: client {client}, server {server}; run `fut daemon shutdown --force` to terminate the old local daemon"
+)]
 struct ProtocolMismatch {
     client: u16,
     server: u16,
-    locality: Locality,
-}
-
-impl ProtocolMismatch {
-    fn guidance(&self) -> &'static str {
-        match self.locality {
-            Locality::Local => {
-                "run `fut daemon shutdown --force` to terminate the old local daemon"
-            }
-            Locality::Remote => "install a matching Fut version for the remote daemon",
-        }
-    }
 }
 
 async fn connect_control_navigator_with_version(
@@ -852,27 +866,20 @@ async fn connect_control_navigator_with_version(
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
-    handshake_navigator(
-        stream,
-        protocol_version,
-        Duration::from_secs(2),
-        Locality::Local,
-    )
-    .await
+    handshake_navigator(stream, protocol_version, Duration::from_secs(2)).await
 }
 
 async fn handshake_navigator(
     stream: UnixStream,
     protocol_version: u16,
     handshake_timeout: Duration,
-    locality: Locality,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
     u16,
 )> {
     let (mut framed, extension_catalog, _) =
-        hello_control(stream, protocol_version, handshake_timeout, locality).await?;
+        hello_control(stream, protocol_version, handshake_timeout).await?;
     send_request(
         &mut framed,
         Some(Uuid::new_v4()),
@@ -887,7 +894,6 @@ async fn hello_control(
     stream: UnixStream,
     protocol_version: u16,
     handshake_timeout: Duration,
-    locality: Locality,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
@@ -923,11 +929,7 @@ async fn hello_control(
                 (extension_catalog, server_version)
             }
             ServerMessage::IncompatibleProtocol { client, server } => {
-                bail!(ProtocolMismatch {
-                    client,
-                    server,
-                    locality
-                });
+                bail!(ProtocolMismatch { client, server });
             }
             ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
             message => bail!("expected control welcome from daemon, received {message:?}"),
@@ -941,6 +943,7 @@ async fn initial_navigator(
     snapshot: ResourceSnapshot,
     presence: crate::protocol::ClientPresenceSnapshot,
     ui: &UiConfig,
+    remote: Option<crate::protocol::remote::Capabilities>,
 ) -> anyhow::Result<Option<TargetSelector>> {
     let mut navigator = NavigatorState::open();
     navigator.accept_global_resources(&snapshot);
@@ -972,6 +975,9 @@ async fn initial_navigator(
             frame = framed.next() => {
                 let Some(frame) = frame else { bail!("daemon disconnected while navigator was open") };
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
+                if remote.is_some_and(|caps| !caps.allows_server(&envelope.message)) {
+                    return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
+                }
                 match envelope.message {
                     ServerMessage::ResourcesChanged { snapshot } => {
                         navigator.accept_global_resources(&snapshot);
@@ -984,6 +990,7 @@ async fn initial_navigator(
                         navigator.accept_presence(&presence);
                     }
                     ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+                    ServerMessage::EndpointError { error } => return Err(error.into()),
                     _ => {}
                 }
             }
@@ -1232,6 +1239,11 @@ async fn run_loop(
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
                 if let Some(perf) = perf.as_mut() {
                     perf.record("decode", decode_started.elapsed(), frame.len());
+                }
+                if let Attachment::Remote(capabilities) = attachment
+                    && !capabilities.allows_server(&envelope.message)
+                {
+                    return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
                 }
                 let request_id = envelope.request_id;
                 match envelope.message {
@@ -1963,7 +1975,8 @@ async fn run_loop(
                     ServerMessage::IncompatibleProtocol { client, server } => {
                         bail!("protocol became incompatible: client {client}, server {server}")
                     }
-                    ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
+                    ServerMessage::Welcome { .. } | ServerMessage::RemoteWelcome(_) => bail!("unexpected second welcome from daemon"),
+                    ServerMessage::EndpointError { error } => return Err(error.into()),
                     ServerMessage::TerminalOutput { .. }
                     | ServerMessage::TerminalOutputMatched { .. }
                     | ServerMessage::AgentPrompted { .. }

@@ -57,6 +57,7 @@ use crate::{
         PresentationTokenPublishAction, RenameSelector, SelectedTarget, SelectedView,
         SelectionExpectation, ServerMessage, TerminalContext, TerminalInputOperation, codec,
         decode_payload, encode_payload,
+        remote::{self, Capabilities, Capability, EndpointError, RemoteWelcome},
     },
     resources::{
         CheckoutDestination, InitialPath, MaterializedTokenValue, Mutation,
@@ -2341,6 +2342,7 @@ impl Drop for OwnedSocket {
 /// kept. All other messages are delivered verbatim in order.
 struct ClientConnection {
     peer_pid: Option<u32>,
+    remote: Option<Capabilities>,
     reader: SplitStream<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>>,
     outbound: Arc<OutboundQueue>,
 }
@@ -2393,6 +2395,7 @@ impl ClientConnection {
             reader,
             outbound,
             peer_pid,
+            remote: None,
         }
     }
 
@@ -2616,9 +2619,67 @@ async fn handle_connection(
     else {
         return Ok(());
     };
-    let first: Envelope<ClientMessage> = decode_payload(&frame?)?;
-    let (version, mode) = match first.message {
-        ClientMessage::Hello { version, mode, .. } => (version, mode),
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(_) => {
+            send(
+                &mut connection,
+                None,
+                ServerMessage::EndpointError {
+                    error: EndpointError::InvalidHandshake,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let first: Envelope<ClientMessage> = match decode_payload(&frame) {
+        Ok(first) => first,
+        Err(_) => {
+            send(
+                &mut connection,
+                None,
+                ServerMessage::EndpointError {
+                    error: EndpointError::InvalidHandshake,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mode = match first.message {
+        ClientMessage::Hello { version, mode, .. } => {
+            if version != PROTOCOL_VERSION {
+                send(
+                    &mut connection,
+                    first.request_id,
+                    ServerMessage::IncompatibleProtocol {
+                        client: version,
+                        server: PROTOCOL_VERSION,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            mode
+        }
+        ClientMessage::RemoteHello(hello) => {
+            let negotiated = remote::decode_handshake::<Envelope<ClientMessage>>(&frame)
+                .and_then(|_| hello.negotiate(Capabilities::ALL));
+            match negotiated {
+                Ok(capabilities) => connection.remote = Some(capabilities),
+                Err(error) => {
+                    send(
+                        &mut connection,
+                        first.request_id,
+                        ServerMessage::EndpointError { error },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            hello.mode
+        }
         _ => {
             send_error(
                 &mut connection,
@@ -2630,18 +2691,6 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    if version != PROTOCOL_VERSION {
-        send(
-            &mut connection,
-            first.request_id,
-            ServerMessage::IncompatibleProtocol {
-                client: version,
-                server: PROTOCOL_VERSION,
-            },
-        )
-        .await?;
-        return Ok(());
-    }
     let client = ClientId::new();
     let presence = shared.lock().await.presence.clone();
     let (leased, interactive_size) = match mode {
@@ -2693,17 +2742,26 @@ async fn handle_connection(
             state.extension_catalog.subscribe(),
         )
     };
-    send(
-        &mut connection,
-        first.request_id,
-        ServerMessage::Welcome {
+    let selected = leased.as_ref().map(Attachment::selected);
+    let welcome = match connection.remote {
+        Some(capabilities) => ServerMessage::RemoteWelcome(RemoteWelcome {
+            generation: remote::GENERATION,
+            codec: remote::CODEC.into(),
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            capabilities: capabilities.names(),
+            selected,
+            extension_catalog: capabilities
+                .contains(Capability::ExtensionCatalog)
+                .then_some(extension_catalog),
+        }),
+        None => ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").into(),
-            selected: leased.as_ref().map(Attachment::selected),
+            selected,
             extension_catalog,
         },
-    )
-    .await?;
+    };
+    send(&mut connection, first.request_id, welcome).await?;
 
     let Some(spawn_size) = interactive_size else {
         return control_loop(&mut connection, shared, exited, shutdown).await;
@@ -2719,6 +2777,9 @@ async fn handle_connection(
             frame = connection.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
+                if reject_remote_method(&mut connection, &envelope).await? {
+                    continue;
+                }
                 if let Some(operation) = fire_and_forget_operation(&envelope.message)
                     && reject_fire_and_forget_request_id(
                         &mut connection,
@@ -3503,7 +3564,7 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportTerminalAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
-                    ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
+                    ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
             changed = attachment.resource_changes.changed() => {
@@ -3547,7 +3608,7 @@ async fn handle_connection(
                     send(&mut connection, None, ServerMessage::AlertsChanged { snapshot }).await?;
                 }
             }
-            changed = extension_changes.changed() => {
+            changed = extension_changes.changed(), if connection.remote.is_none_or(|caps| caps.contains(Capability::ExtensionCatalog)) => {
                 if changed.is_err() {
                     break;
                 }
@@ -3683,6 +3744,29 @@ async fn handle_connection(
     }
 }
 
+/// Reject before dispatch: even a negotiated peer cannot reach private methods
+/// (notably Shutdown) through either connection mode.
+async fn reject_remote_method(
+    connection: &mut ClientConnection,
+    envelope: &Envelope<ClientMessage>,
+) -> Result<bool> {
+    if connection
+        .remote
+        .is_some_and(|caps| !caps.allows_client(&envelope.message))
+    {
+        send(
+            connection,
+            envelope.request_id,
+            ServerMessage::EndpointError {
+                error: EndpointError::MethodNotNegotiated,
+            },
+        )
+        .await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn control_loop(
     connection: &mut ClientConnection,
     shared: Shared,
@@ -3719,6 +3803,9 @@ async fn control_loop(
         };
         let Some(frame) = frame else { break };
         let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
+        if reject_remote_method(connection, &envelope).await? {
+            continue;
+        }
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
             && reject_fire_and_forget_request_id(connection, envelope.request_id, operation).await?
         {
@@ -4347,7 +4434,7 @@ async fn control_loop(
                 )
                 .await?
             }
-            ClientMessage::Hello { .. } => {
+            ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => {
                 send_error(
                     connection,
                     envelope.request_id,
@@ -6639,8 +6726,20 @@ async fn send_error(
 async fn send(
     connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
-    message: ServerMessage,
+    mut message: ServerMessage,
 ) -> Result<()> {
+    if connection
+        .remote
+        .is_some_and(|caps| !caps.allows_server(&message))
+        && !matches!(message, ServerMessage::RemoteWelcome(_))
+    {
+        if request_id.is_none() {
+            return Ok(());
+        }
+        message = ServerMessage::EndpointError {
+            error: EndpointError::MethodNotNegotiated,
+        };
+    }
     connection.enqueue(Outbound::Frame(Bytes::from(encode_payload(&Envelope {
         request_id,
         message,

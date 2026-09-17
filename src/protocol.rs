@@ -1,5 +1,7 @@
-//! Versioned messages and bounded MessagePack framing for the local Fut
-//! protocol.
+//! Private local messages and bounded MessagePack framing. The independently
+//! versioned remote contract reuses an explicit subset; see [`remote`].
+
+pub mod remote;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -19,7 +21,7 @@ use crate::{
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
-/// Current clients and daemons require an exact protocol match. The protocol is
+/// Local clients and daemons require an exact protocol match. The protocol is
 /// the package version's minor component: Fut 0.12.x uses protocol 12.
 pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
@@ -362,6 +364,7 @@ pub enum ExtensionTokenStyle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    RemoteHello(remote::RemoteHello),
     Hello {
         version: u16,
         client_version: String,
@@ -584,6 +587,10 @@ pub enum PresentationTokenPublishAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    RemoteWelcome(remote::RemoteWelcome),
+    EndpointError {
+        error: remote::EndpointError,
+    },
     Welcome {
         version: u16,
         server_version: String,

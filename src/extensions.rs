@@ -346,6 +346,16 @@ impl ExtensionRegistry {
     /// repeats all structural bounds and pins the fingerprint so a client never
     /// accepts partial or malformed extension state from the wire.
     pub(crate) fn from_catalog(catalog: ExtensionCatalog) -> Result<Self> {
+        Self::from_catalog_inner(catalog, true)
+    }
+
+    /// Remote declarations are rendered, never executed locally. Their Fut
+    /// requirement applies to the daemon hosting them, not this UI's package.
+    pub(crate) fn from_remote_catalog(catalog: ExtensionCatalog) -> Result<Self> {
+        Self::from_catalog_inner(catalog, false)
+    }
+
+    fn from_catalog_inner(catalog: ExtensionCatalog, check_package_version: bool) -> Result<Self> {
         if catalog.generation == 0 {
             bail!("extension catalog generation must be at least 1");
         }
@@ -379,7 +389,7 @@ impl ExtensionRegistry {
         let mut extensions = Vec::with_capacity(catalog.extensions.len());
         let mut ids = HashSet::new();
         for declaration in catalog.extensions {
-            let extension = extension_from_declaration(declaration)?;
+            let extension = extension_from_declaration(declaration, check_package_version)?;
             if !ids.insert(extension.id.clone()) {
                 bail!(
                     "extension catalog contains duplicate extension id {:?}",
@@ -567,7 +577,10 @@ fn validate_command_fields(
         .collect()
 }
 
-fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Extension> {
+fn extension_from_declaration(
+    declaration: ExtensionDeclaration,
+    check_package_version: bool,
+) -> Result<Extension> {
     if declaration.api_version != MANIFEST_API_VERSION {
         bail!(
             "extension {:?} catalog declares unsupported api_version {}",
@@ -592,7 +605,7 @@ fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Exten
     })?;
     let running_fut_version = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("Cargo package version must be valid SemVer");
-    if !fut_requirement.matches(&running_fut_version) {
+    if check_package_version && !fut_requirement.matches(&running_fut_version) {
         bail!(
             "extension {:?} catalog is incompatible with Fut {}",
             declaration.id,
@@ -2381,6 +2394,20 @@ fut = ">=0.7.0, <1.0.0"
         fs::write(&hook, script).unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         temporary
+    }
+
+    #[test]
+    fn remote_catalog_package_requirements_apply_to_the_daemon_not_the_renderer() {
+        let root = extension_root("id = 'remote'\ncapabilities = []\n");
+        let mut extensions = load(&[root.path().to_owned()]).unwrap();
+        extensions[0].fut_requirement = VersionReq::parse(">=99.0.0").unwrap();
+        let catalog = registry(extensions).catalog().unwrap();
+        assert!(ExtensionRegistry::from_catalog(catalog.clone()).is_err());
+        let remote = ExtensionRegistry::from_remote_catalog(catalog.clone()).unwrap();
+        assert_eq!(remote.catalog().unwrap(), catalog);
+        let mut tampered = catalog;
+        tampered.fingerprint = "0".repeat(64);
+        assert!(ExtensionRegistry::from_remote_catalog(tampered).is_err());
     }
 
     fn registry(extensions: Vec<Extension>) -> ExtensionRegistry {

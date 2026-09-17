@@ -1668,6 +1668,37 @@ pub(crate) struct StagedUiConfig {
 }
 
 impl StagedUiConfig {
+    /// Missing remote catalog support disables extension declarations and their
+    /// local overrides; it must not make the rest of the interface unusable.
+    pub(crate) fn materialize_remote(
+        &self,
+        catalog: Option<&crate::protocol::ExtensionCatalog>,
+    ) -> Result<UiConfig> {
+        if let Some(catalog) = catalog {
+            let registry = extensions::ExtensionRegistry::from_remote_catalog(catalog.clone())?;
+            return materialize_config(
+                self.config.clone(),
+                registry.extensions().to_vec(),
+                registry.config().clone(),
+                self.source.as_deref(),
+            );
+        }
+        let mut config = self.config.clone();
+        config.extension_commands.clear();
+        config
+            .ui
+            .bindings
+            .values
+            .retain(|key, _| !key.contains(':'));
+        remove_extension_tokens(&mut config.ui);
+        materialize_config(
+            config,
+            Vec::new(),
+            Default::default(),
+            self.source.as_deref(),
+        )
+    }
+
     pub(crate) fn materialize(
         &self,
         catalog: &crate::protocol::ExtensionCatalog,
@@ -1679,6 +1710,46 @@ impl StagedUiConfig {
             registry.config().clone(),
             self.source.as_deref(),
         )
+    }
+}
+
+fn remove_extension_tokens(ui: &mut UiConfig) {
+    fn remove(segments: &mut Vec<SegmentConfig>) {
+        segments.retain(|segment| {
+            !matches!(segment, SegmentConfig::Token { token, .. } if token.contains(".extension."))
+        });
+    }
+    for group in ui
+        .tab_bar
+        .left
+        .iter_mut()
+        .chain(&mut ui.tab_bar.center)
+        .chain(&mut ui.tab_bar.right)
+    {
+        remove(&mut group.segments);
+    }
+    remove(&mut ui.tab_bar.item.segments);
+    for sidebar in [&mut ui.sidebar.left, &mut ui.sidebar.right] {
+        for component in &mut sidebar.components {
+            if let SidebarComponentConfig::Workspaces {
+                header,
+                footer,
+                row,
+                ..
+            } = component
+            {
+                for segments in [
+                    header,
+                    footer,
+                    &mut row.left,
+                    &mut row.body,
+                    &mut row.right,
+                    &mut row.detail,
+                ] {
+                    remove(segments);
+                }
+            }
+        }
     }
 }
 
@@ -3618,6 +3689,11 @@ components = [
             .unwrap();
 
         fs::remove_file(manifest).unwrap();
+        let without_catalog = staged.materialize_remote(None).unwrap();
+        assert!(without_catalog.extensions.is_empty());
+        assert!(without_catalog.bindings.command(0).is_none());
+        assert!(without_catalog.tab_bar.item.segments.is_empty());
+        assert!(without_catalog.bindings.action_for_suffix(b"N").is_none());
         let ui = staged.materialize(&catalog).unwrap();
         let command = ui.bindings.command(0).unwrap();
         assert_eq!(command.title, "Launch catalog");

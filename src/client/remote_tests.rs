@@ -63,8 +63,17 @@ fields = [{ name = 'value', label = 'Value' }]
         .unwrap()
         .materialize(&catalog)
         .unwrap();
-    assert!(Attachment::Remote.client_hooks(&ui).unwrap().is_none());
-    assert!(Attachment::Remote.local_socket().is_err());
+    assert!(
+        Attachment::Remote(crate::protocol::remote::Capabilities::ALL)
+            .client_hooks(&ui)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Attachment::Remote(crate::protocol::remote::Capabilities::ALL)
+            .local_socket()
+            .is_err()
+    );
     assert_eq!(
         Attachment::Local(root.path()).local_socket().unwrap(),
         root.path()
@@ -148,7 +157,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &mut ui,
             &mut temporary,
-            Attachment::Remote,
+            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
             &background,
             &location,
             &mut reload,
@@ -184,7 +193,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            Attachment::Remote,
+            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
             &background,
         )
         .await
@@ -219,7 +228,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            Attachment::Remote,
+            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
             &background,
         )
         .await
@@ -270,111 +279,251 @@ fn remote_link_policy_applies_at_rendering_and_preserves_local_links() {
 }
 
 #[tokio::test]
-async fn remote_control_rejects_unsafe_daemon_version_text() {
-    let (stream, peer) = UnixStream::pair().unwrap();
-    let server = tokio::spawn(async move {
-        let mut peer = Framed::new(peer, codec());
-        let hello: Envelope<ClientMessage> =
-            decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
-        peer.send(Bytes::from(
-            encode_payload(&Envelope {
-                request_id: hello.request_id,
-                message: ServerMessage::Welcome {
+async fn local_handshakes_retain_exact_version_guidance() {
+    for interactive in [false, true] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(async move {
+            let mut peer = Framed::new(peer, codec());
+            let hello: Envelope<ClientMessage> =
+                decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                hello.message,
+                ClientMessage::Hello {
                     version: PROTOCOL_VERSION,
-                    server_version: "0.22.0\u{1b}[2J".into(),
-                    selected: None,
-                    extension_catalog: crate::protocol::ExtensionCatalog {
-                        generation: 1,
-                        fingerprint: String::new(),
-                        extensions: Vec::new(),
-                        config: Default::default(),
+                    ..
+                }
+            ));
+            peer.send(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: hello.request_id,
+                    message: ServerMessage::IncompatibleProtocol {
+                        client: PROTOCOL_VERSION,
+                        server: PROTOCOL_VERSION - 1,
                     },
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            assert!(peer.next().await.is_none());
+        });
+        let error = if interactive {
+            handshake_interactive(
+                stream,
+                None,
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
                 },
-            })
-            .unwrap(),
-        ))
-        .await
-        .unwrap();
-    });
-    let error = hello_control(
-        stream,
-        PROTOCOL_VERSION,
-        Duration::from_secs(1),
-        Locality::Remote,
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("invalid version string"));
-    server.await.unwrap();
+                crate::domain::ClientId::new(),
+                PROTOCOL_VERSION,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err()
+        } else {
+            handshake_navigator(stream, PROTOCOL_VERSION, Duration::from_secs(1))
+                .await
+                .unwrap_err()
+        };
+        assert!(error.downcast_ref::<ProtocolMismatch>().is_some());
+        assert!(error.to_string().contains("fut daemon shutdown --force"));
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
-async fn handshakes_reject_mismatch_with_locality_specific_guidance() {
-    for locality in [Locality::Local, Locality::Remote] {
-        for interactive in [false, true] {
+async fn remote_handshakes_accept_unequal_versions_and_omit_optional_behavior() {
+    use crate::protocol::remote::{self as wire, Capability, RemoteWelcome};
+    for interactive in [false, true] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let target = targets(1).remove(0);
+        let selected = selected_view(1, target.clone(), vec![target]);
+        let selector = TargetSelector::Terminal(selected.focused.terminal_id);
+        let server = tokio::spawn(async move {
+            let mut peer = Framed::new(peer, codec());
+            let hello: Envelope<ClientMessage> =
+                wire::decode_handshake(&peer.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::RemoteHello(offer) = hello.message else {
+                panic!("expected remote hello")
+            };
+            assert_eq!(offer.client_version, env!("CARGO_PKG_VERSION"));
+            peer.send(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: hello.request_id,
+                    message: ServerMessage::RemoteWelcome(RemoteWelcome {
+                        generation: wire::GENERATION,
+                        codec: wire::CODEC.into(),
+                        server_version: "0.999.1".into(),
+                        capabilities: offer.required.clone(),
+                        selected: interactive.then_some(selected),
+                        extension_catalog: None,
+                    }),
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            if !interactive {
+                let request: Envelope<ClientMessage> =
+                    decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request.message, ClientMessage::WatchResources);
+            }
+            // No WatchAlerts, Ping, catalog request or local Hello fallback.
+            assert!(peer.next().await.is_none());
+        });
+        let connection = if interactive {
+            remote::interactive(
+                stream,
+                selector,
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+        } else {
+            remote::navigator(stream, Duration::from_secs(1))
+                .await
+                .unwrap()
+        };
+        assert_eq!(connection.welcome.server_version, "0.999.1");
+        for cap in [
+            Capability::Alerts,
+            Capability::ExtensionCatalog,
+            Capability::Health,
+        ] {
+            assert!(!connection.capabilities.contains(cap));
+        }
+        let ui = stage_ui_config(&config::ConfigLocation::disabled())
+            .unwrap()
+            .materialize_remote(connection.welcome.extension_catalog.as_ref())
+            .unwrap();
+        assert!(ui.extensions.is_empty());
+        assert!(
+            Attachment::Remote(connection.capabilities)
+                .local_socket()
+                .is_err()
+        );
+        drop(connection);
+        server.await.unwrap();
+    }
+}
+
+#[test]
+fn unsupported_optional_remote_catalog_disables_only_extension_presentation() {
+    let staged = stage_ui_config(&config::ConfigLocation::disabled()).unwrap();
+    let invalid = crate::protocol::ExtensionCatalog {
+        generation: 0,
+        fingerprint: String::new(),
+        extensions: Vec::new(),
+        config: Default::default(),
+    };
+    let ui = remote::materialize_ui(&staged, Some(&invalid)).unwrap();
+    assert!(ui.extensions.is_empty());
+}
+
+#[tokio::test]
+async fn remote_handshakes_reject_malformed_or_incompatible_peers_with_typed_errors() {
+    use crate::protocol::remote::{self as wire, EndpointError, RemoteWelcome};
+    for interactive in [false, true] {
+        for case in 0..13 {
             let (stream, peer) = UnixStream::pair().unwrap();
+            let target = targets(1).remove(0);
+            let selected = selected_view(1, target.clone(), vec![target.clone()]);
             let server = tokio::spawn(async move {
                 let mut peer = Framed::new(peer, codec());
                 let hello: Envelope<ClientMessage> =
                     decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
-                assert!(matches!(
-                    hello.message,
-                    ClientMessage::Hello {
-                        version: PROTOCOL_VERSION,
-                        ..
+                let ClientMessage::RemoteHello(offer) = hello.message else {
+                    panic!("expected remote hello")
+                };
+                let mut welcome = RemoteWelcome {
+                    generation: wire::GENERATION,
+                    codec: wire::CODEC.into(),
+                    server_version: "0.999.1".into(),
+                    capabilities: offer.required,
+                    selected: interactive.then_some(selected.clone()),
+                    extension_catalog: None,
+                };
+                match case {
+                    0 => welcome.generation += 1,
+                    1 => welcome.codec = "other-codec".into(),
+                    2 => welcome.capabilities.clear(),
+                    3 => welcome.capabilities.push("unknown.v1".into()),
+                    4 => welcome.capabilities.push("metadata.v1".into()),
+                    5 => welcome.server_version = "0.1.0\x1b[2J".into(),
+                    6 => welcome.server_version = "v".repeat(wire::MAX_VERSION_BYTES + 1),
+                    10 => welcome.selected = (!interactive).then_some(selected),
+                    11 => {
+                        if let Some(selected) = &mut welcome.selected {
+                            selected.panes.clear();
+                        } else {
+                            welcome.capabilities.push("alerts.v1".into());
+                            welcome.capabilities.push("alerts.v1".into());
+                        }
                     }
-                ));
-                peer.send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: hello.request_id,
-                        message: ServerMessage::IncompatibleProtocol {
+                    _ => {}
+                }
+                let mut payload = encode_payload(&Envelope {
+                    request_id: if case == 7 { None } else { hello.request_id },
+                    message: if case == 12 {
+                        ServerMessage::IncompatibleProtocol {
                             client: PROTOCOL_VERSION,
-                            server: PROTOCOL_VERSION - 1,
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
+                            server: PROTOCOL_VERSION + 1,
+                        }
+                    } else {
+                        ServerMessage::RemoteWelcome(welcome)
+                    },
+                })
                 .unwrap();
+                if case == 8 {
+                    payload.push(0);
+                }
+                if case == 9 {
+                    payload = vec![0xc1];
+                }
+                peer.send(Bytes::from(payload)).await.unwrap();
                 assert!(peer.next().await.is_none());
             });
             let error = if interactive {
-                handshake_interactive(
+                remote::interactive(
                     stream,
-                    None,
+                    TargetSelector::Terminal(target.terminal_id),
                     TerminalSize {
                         columns: 80,
                         rows: 24,
                     },
-                    crate::domain::ClientId::new(),
-                    PROTOCOL_VERSION,
                     Duration::from_secs(1),
-                    locality,
                 )
                 .await
-                .unwrap_err()
+                .err()
+                .unwrap()
             } else {
-                handshake_navigator(stream, PROTOCOL_VERSION, Duration::from_secs(1), locality)
+                remote::navigator(stream, Duration::from_secs(1))
                     .await
-                    .unwrap_err()
+                    .err()
+                    .unwrap()
             };
-            assert!(error.to_string().contains("incompatible protocol"));
-            let message = error.to_string();
-            match locality {
-                Locality::Local => {
-                    assert!(message.contains("fut daemon shutdown --force"), "{message}");
-                    assert!(message.contains("local daemon"), "{message}");
-                    assert!(!message.contains("install a matching"));
-                }
-                Locality::Remote => {
-                    assert!(
-                        message.contains("install a matching Fut version"),
-                        "{message}"
-                    );
-                    assert!(message.contains("remote daemon"), "{message}");
-                    assert!(!message.contains("shutdown"));
-                }
-            }
+            let error = remote::report_error(error.context(REMOTE_HANDSHAKE_FAILED));
+            let expected = match case {
+                0 => EndpointError::IncompatibleGeneration {
+                    client: wire::GENERATION,
+                    server: wire::GENERATION + 1,
+                },
+                1 => EndpointError::UnsupportedCodec,
+                2 => EndpointError::MissingRequiredCapability,
+                _ => EndpointError::InvalidHandshake,
+            };
+            assert_eq!(
+                error.downcast_ref::<EndpointError>(),
+                Some(&expected),
+                "case {case}: {error:#}"
+            );
+            assert!(!format!("{error:#}").contains("shutdown"));
+            assert!(!format!("{error:#}").contains('\x1b'));
             server.await.unwrap();
         }
     }

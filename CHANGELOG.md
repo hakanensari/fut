@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remote attachments now work across compatible Fut versions and adapt to the remote daemon's supported features.
 - Added `fut --remote HOST` for using the local interface and clipboard with an existing Fut daemon over SSH.
 - Added `fut machine add/list/show/rename/enable/disable/remove` for a private catalog of saved SSH machines; `machine add` confirms the remote daemon over SSH before saving, and the other commands never contact it.
 - Added `fut attach --ignore-protocol-mismatch` as an explicit escape hatch for accessing older daemons.

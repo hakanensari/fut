@@ -1,6 +1,6 @@
 ---
 id: fut-9uqd
-status: in_progress
+status: closed
 deps: [fut-62nc]
 links: []
 created: 2026-09-15T13:21:56Z
@@ -21,3 +21,11 @@ Keep the private protocol strict for internal same-install operations. Introduce
 ## Acceptance Criteria
 
 Compatible unequal Fut versions negotiate a documented remote contract; unsupported optional capabilities disable only their features; incompatible generations produce a typed endpoint error; frame bounds and malformed-handshake tests cover the network trust boundary; local exact-version safeguards remain intact.
+
+## Notes
+
+**2026-09-17T07:52:15Z**
+
+Implemented remote generation 1 with explicit RemoteHello/RemoteWelcome DTOs, msgpack-map-v1, bounded required/optional capabilities, diagnostic-only package versions, typed endpoint errors, and daemon/client method gates. SSH remains protocol-blind; local Hello/Welcome, exact-version enforcement, mismatch escape hatch, and lifecycle code are preserved. Optional alerts/catalog/health omission disables only those features. Remote extension catalogs retain structural/fingerprint checks without requiring the local renderer package version. Added frozen contract documentation, usage guidance, and changelog entry.
+
+Validation passed: the full `mise run check` suite with 666 library tests, 144 E2E tests, and all integration and extension checks. This includes unequal versions, optional omission, malformed/incompatible peers, failure isolation, and the local unsupported-protocol regression.

@@ -2,6 +2,7 @@
 use std::path::Path;
 
 use super::{actions::ClientAction, config::UiConfig};
+use crate::protocol::remote::Capabilities;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Locality {
@@ -12,21 +13,21 @@ pub(super) enum Locality {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Attachment<'a> {
     Local(&'a Path),
-    Remote,
+    Remote(Capabilities),
 }
 
 impl<'a> Attachment<'a> {
     pub(super) fn locality(self) -> Locality {
         match self {
             Self::Local(_) => Locality::Local,
-            Self::Remote => Locality::Remote,
+            Self::Remote(_) => Locality::Remote,
         }
     }
 
     pub(super) fn local_socket(self) -> anyhow::Result<&'a Path> {
         match self {
             Self::Local(path) => Ok(path),
-            Self::Remote => anyhow::bail!("local commands unavailable during remote attachment"),
+            Self::Remote(_) => anyhow::bail!("local commands unavailable during remote attachment"),
         }
     }
 }
@@ -69,7 +70,7 @@ impl Attachment<'_> {
         ui: &UiConfig,
     ) -> anyhow::Result<Option<crate::extensions::ClientHookRuntime>> {
         match self {
-            Self::Remote => Ok(None),
+            Self::Remote(_) => Ok(None),
             Self::Local(socket) => Ok(Some(crate::extensions::ClientHookRuntime::new(
                 ui.extensions.clone(),
                 std::env::current_exe()?,

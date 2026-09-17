@@ -1,4 +1,5 @@
 mod remote;
+mod remote_contract;
 
 use super::*;
 use std::os::fd::OwnedFd;
