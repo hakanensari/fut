@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `fut --remote HOST` for using the local interface and clipboard with an existing Fut daemon over SSH.
 - Added `fut attach --ignore-protocol-mismatch` as an explicit escape hatch for accessing older daemons.
 
 ## 0.22

@@ -15,4 +15,5 @@ pub(crate) mod project_definition;
 pub mod protocol;
 pub mod resources;
 pub mod splits;
+pub(crate) mod ssh_bridge;
 pub mod terminal;

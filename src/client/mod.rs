@@ -3,6 +3,7 @@
 mod actions;
 mod agent_dialog;
 mod agents;
+mod attachment;
 mod cheatsheet;
 mod chrome;
 mod command_bar;
@@ -23,6 +24,8 @@ mod notifications;
 mod perf;
 mod presentation;
 mod project_opener;
+#[cfg(test)]
+mod remote_tests;
 mod rename;
 mod sidebar;
 mod spinners;
@@ -45,6 +48,7 @@ use std::{
 use actions::{ClientAction, FocusDirection, HistoryScope, NavigationScope};
 use agent_dialog::{AgentsAction, AgentsDialog};
 use anyhow::{Context, bail};
+use attachment::{Attachment, Locality};
 use bytes::Bytes;
 use chrome::{
     ClientLayout, MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar,
@@ -459,7 +463,7 @@ pub async fn attach_navigator(
         alerts,
         ui,
         catalog.generation,
-        socket_path,
+        Attachment::Local(socket_path),
         config_location,
         guard.enhanced_keyboard,
     )
@@ -467,6 +471,108 @@ pub async fn attach_navigator(
     drop(terminal);
     drop(guard);
     result
+}
+
+/// Phase 1 is attach-only: SSH forwards an already-running daemon's protocol.
+/// No local socket, cwd, or daemon lifecycle operation is involved.
+pub async fn attach_remote(
+    host: &str,
+    config_location: &config::ConfigLocation,
+) -> anyhow::Result<()> {
+    attach_remote_inner(host, config_location)
+        .await
+        .map_err(|error| anyhow::anyhow!(one_line_error(&error)))
+}
+
+async fn attach_remote_inner(
+    host: &str,
+    config_location: &config::ConfigLocation,
+) -> anyhow::Result<()> {
+    let staged = stage_ui_config(config_location)?;
+    let (stream, navigator_bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
+    let navigator = async {
+        let (mut connection, ui, snapshot, presence) = prepare_remote(async {
+            let (mut connection, catalog, _) = handshake_navigator(
+                stream,
+                PROTOCOL_VERSION,
+                Duration::from_secs(60),
+                Locality::Remote,
+            )
+            .await
+            .context("remote attachment failed (SSH or daemon handshake)")?;
+            let ui = staged.materialize(&catalog)?;
+            let (snapshot, presence) =
+                match time::timeout(Duration::from_secs(2), receive(&mut connection))
+                    .await
+                    .context("remote resource snapshot timed out")??
+                {
+                    ServerMessage::Resources { snapshot, presence } => (snapshot, presence),
+                    ServerMessage::Error { code, message } => {
+                        bail!("remote daemon error ({code}): {message}")
+                    }
+                    _ => bail!("expected resources from remote daemon"),
+                };
+            Ok((connection, ui, snapshot, presence))
+        })
+        .await?;
+        let _guard = TerminalGuard::enter()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        initial_navigator(&mut terminal, &mut connection, snapshot, presence, &ui).await
+    }
+    .await;
+    let cleanup = navigator_bridge.shutdown().await;
+    let selector = navigator?;
+    cleanup?;
+    let Some(selector) = selector else {
+        return Ok(());
+    };
+
+    // Selection opens a new SSH connection after the navigator's terminal and
+    // connection have been dropped, so authentication happens in cooked mode.
+    let (stream, interactive_bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
+    let result = async {
+        let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
+        let (mut framed, selected, catalog, alerts) = prepare_remote(handshake_interactive(
+            stream,
+            Some(selector),
+            TerminalSize { columns, rows },
+            crate::domain::ClientId::new(),
+            PROTOCOL_VERSION,
+            Duration::from_secs(60),
+            Locality::Remote,
+        ))
+        .await?;
+        let ui = staged.materialize(&catalog)?;
+        let guard = TerminalGuard::enter()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        run(
+            &mut terminal,
+            &mut framed,
+            selected,
+            alerts,
+            ui,
+            catalog.generation,
+            Attachment::Remote,
+            config_location,
+            guard.enhanced_keyboard,
+        )
+        .await
+    }
+    .await;
+    let cleanup = interactive_bridge.shutdown().await;
+    result.and(cleanup)
+}
+
+// Authentication can be slow. Cancellation before terminal setup must still
+// unwind through the bridge owner so its SSH process is killed and reaped.
+async fn prepare_remote<T>(work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    let mut termination = TerminationSignals::subscribe()?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        result = work => result,
+        name = termination.recv() => bail!("remote attachment terminated by {name}"),
+        _ = interrupt.recv() => bail!("remote attachment interrupted"),
+    }
 }
 
 pub(crate) fn stage_ui_config(
@@ -503,7 +609,7 @@ pub(crate) async fn attach_with_ui(
         alerts,
         ui,
         catalog.generation,
-        socket_path,
+        Attachment::Local(socket_path),
         config_location,
         guard.enhanced_keyboard,
     )
@@ -585,6 +691,32 @@ async fn connect_interactive(
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
+    handshake_interactive(
+        stream,
+        selector,
+        size,
+        alert_client_id,
+        protocol_version,
+        Duration::from_secs(2),
+        Locality::Local,
+    )
+    .await
+}
+
+async fn handshake_interactive(
+    stream: UnixStream,
+    selector: Option<TargetSelector>,
+    size: TerminalSize,
+    alert_client_id: crate::domain::ClientId,
+    protocol_version: u16,
+    handshake_timeout: Duration,
+    locality: Locality,
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    SelectedView,
+    crate::protocol::ExtensionCatalog,
+    crate::alerts::ClientAlertSnapshot,
+)> {
     let mut framed = Framed::new(stream, codec());
     send(
         &mut framed,
@@ -595,7 +727,7 @@ async fn connect_interactive(
         },
     )
     .await?;
-    let selected = match time::timeout(Duration::from_secs(2), receive(&mut framed))
+    let selected = match time::timeout(handshake_timeout, receive(&mut framed))
         .await
         .context("daemon handshake timed out")??
     {
@@ -610,10 +742,11 @@ async fn connect_interactive(
             bail!("daemon welcomed client with unsupported protocol version {version}")
         }
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!(
-                "incompatible protocol: client {client}, server {server}; run `fut daemon \
-                 shutdown --force` to terminate the old daemon"
-            )
+            bail!(ProtocolMismatch {
+                client,
+                server,
+                locality
+            })
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
@@ -655,12 +788,22 @@ async fn connect_control_navigator(
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "incompatible protocol: client {client}, server {server}; run `fut daemon shutdown --force` to terminate the old daemon"
-)]
+#[error("incompatible protocol: client {client}, server {server}; {}", self.guidance())]
 struct ProtocolMismatch {
     client: u16,
     server: u16,
+    locality: Locality,
+}
+
+impl ProtocolMismatch {
+    fn guidance(&self) -> &'static str {
+        match self.locality {
+            Locality::Local => {
+                "run `fut daemon shutdown --force` to terminate the old local daemon"
+            }
+            Locality::Remote => "install a matching Fut version for the remote daemon",
+        }
+    }
 }
 
 async fn connect_control_navigator_with_version(
@@ -674,6 +817,25 @@ async fn connect_control_navigator_with_version(
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
+    handshake_navigator(
+        stream,
+        protocol_version,
+        Duration::from_secs(2),
+        Locality::Local,
+    )
+    .await
+}
+
+async fn handshake_navigator(
+    stream: UnixStream,
+    protocol_version: u16,
+    handshake_timeout: Duration,
+    locality: Locality,
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    crate::protocol::ExtensionCatalog,
+    u16,
+)> {
     let mut framed = Framed::new(stream, codec());
     send(
         &mut framed,
@@ -684,7 +846,7 @@ async fn connect_control_navigator_with_version(
         },
     )
     .await?;
-    let extension_catalog = match time::timeout(Duration::from_secs(2), receive(&mut framed))
+    let extension_catalog = match time::timeout(handshake_timeout, receive(&mut framed))
         .await
         .context("daemon handshake timed out")??
     {
@@ -695,7 +857,11 @@ async fn connect_control_navigator_with_version(
             ..
         } if version == protocol_version => extension_catalog,
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!(ProtocolMismatch { client, server });
+            bail!(ProtocolMismatch {
+                client,
+                server,
+                locality
+            });
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected control welcome from daemon, received {message:?}"),
@@ -776,15 +942,11 @@ async fn run(
     alerts: crate::alerts::ClientAlertSnapshot,
     ui: UiConfig,
     catalog_generation: u64,
-    socket_path: &Path,
+    attachment: Attachment<'_>,
     config_location: &config::ConfigLocation,
     enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
-    let mut client_hooks = crate::extensions::ClientHookRuntime::new(
-        ui.extensions.clone(),
-        std::env::current_exe().context("resolve current Fut executable")?,
-        socket_path.to_owned(),
-    );
+    let mut client_hooks = attachment.client_hooks(&ui)?;
     let result = run_loop(
         terminal,
         framed,
@@ -792,13 +954,15 @@ async fn run(
         alerts,
         ui,
         catalog_generation,
-        socket_path,
+        attachment,
         config_location,
         &mut client_hooks,
         enhanced_keyboard,
     )
     .await;
-    client_hooks.shutdown().await;
+    if let Some(hooks) = client_hooks {
+        hooks.shutdown().await;
+    }
     result
 }
 
@@ -813,9 +977,9 @@ async fn run_loop(
     alerts: crate::alerts::ClientAlertSnapshot,
     mut ui: UiConfig,
     mut extension_generation: u64,
-    socket_path: &Path,
+    attachment: Attachment<'_>,
     config_location: &config::ConfigLocation,
-    client_hooks: &mut crate::extensions::ClientHookRuntime,
+    client_hooks: &mut Option<crate::extensions::ClientHookRuntime>,
     enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
@@ -823,7 +987,7 @@ async fn run_loop(
     let mut prefix = PrefixState::new(ui.bindings.clone());
     let mut prefix_keys_awaiting_release = HashSet::new();
     let mut mouse_input = MouseInputState::default();
-    let mut view = ViewState::new(selected)?;
+    let mut view = ViewState::new(attachment.locality(), selected)?;
     let mut resources = ResourceState::default();
     resources.accept_alerts(alerts);
     let mut surface: Option<ClientSurface> = None;
@@ -897,7 +1061,7 @@ async fn run_loop(
                                 temporary_command
                                     .as_ref()
                                     .expect("command exists")
-                                    .write_failure_log(socket_path)
+                                    .write_failure_log(attachment.local_socket()?)
                                     .await,
                             )
                         };
@@ -1217,6 +1381,11 @@ async fn run_loop(
                         force_draw = true;
                     }
                     ServerMessage::ExtensionCatalogChanged { catalog } => {
+                        if attachment.locality() == Locality::Remote {
+                            toasts.info("extensions changed remotely · reattach to refresh");
+                            force_draw = true;
+                            continue;
+                        }
                         if catalog.generation <= extension_generation {
                             continue;
                         }
@@ -1336,7 +1505,9 @@ async fn run_loop(
                         let presence_changed = resources.accept_presence(presence);
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
-                            client_hooks.observe(snapshot, view.focused());
+                            if let Some(hooks) = client_hooks.as_mut() {
+                                hooks.observe(snapshot, view.focused());
+                            }
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -1366,7 +1537,9 @@ async fn run_loop(
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
-                            client_hooks.observe(snapshot, view.focused());
+                            if let Some(hooks) = client_hooks.as_mut() {
+                                hooks.observe(snapshot, view.focused());
+                            }
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -1466,7 +1639,9 @@ async fn run_loop(
                             &ui,
                         ).await?;
                         if let Some(snapshot) = resources.snapshot() {
-                            client_hooks.observe(snapshot, view.focused());
+                            if let Some(hooks) = client_hooks.as_mut() {
+                                hooks.observe(snapshot, view.focused());
+                            }
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -1864,7 +2039,7 @@ async fn run_loop(
                                     &submission.command,
                                     view.focused().child_pid,
                                     host,
-                                    socket_path,
+                                    attachment.local_socket()?,
                                     Some(&submission.context),
                                     Some(&submission.values),
                                 ).await {
@@ -2478,7 +2653,7 @@ async fn run_loop(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                    socket_path,
+                                    attachment,
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
@@ -2741,7 +2916,7 @@ async fn run_loop(
                                             host,
                                             &ui,
                                             &mut temporary_command,
-                                            socket_path,
+                                            attachment,
                                             &background_results,
                                         )
                                         .await?,
@@ -3054,7 +3229,7 @@ async fn run_loop(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                    socket_path,
+                                    attachment,
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
@@ -3216,7 +3391,7 @@ async fn run_loop(
                                 &ui.styles,
                                 frame.buffer_mut(),
                             );
-                            frame.render_widget(Screen(&command.screen), content);
+                            frame.render_widget(Screen(&command.screen, Locality::Local), content);
                             if command.screen.cursor.visible
                                 && command.screen.cursor.column < content.width
                                 && command.screen.cursor.row < content.height
@@ -4227,7 +4402,7 @@ async fn install_ui_config(
     workspace_history: &NavigationHistory,
     prefix: &mut PrefixState,
     ui: &mut UiConfig,
-    client_hooks: &mut crate::extensions::ClientHookRuntime,
+    client_hooks: &mut Option<crate::extensions::ClientHookRuntime>,
 ) -> anyhow::Result<()> {
     // Command launch surfaces own declarations derived from the current
     // extension generation. Close them before replacing that generation.
@@ -4242,7 +4417,9 @@ async fn install_ui_config(
         *surface = None;
     }
     prefix.replace_bindings(candidate.bindings.clone());
-    client_hooks.reconfigure(candidate.extensions.clone());
+    if let Some(hooks) = client_hooks.as_mut() {
+        hooks.reconfigure(candidate.extensions.clone());
+    }
     *ui = candidate;
     let close_sidebar = if let (Some(ClientSurface::Sidebar(sidebar)), Some(snapshot)) =
         (surface.as_mut(), resources.snapshot())
@@ -4433,7 +4610,7 @@ async fn dispatch_presentation_token_action(
     host: Rect,
     ui: &UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
-    socket_path: &Path,
+    attachment: Attachment<'_>,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
 ) -> anyhow::Result<Option<Toast>> {
     let Some(snapshot) = resources.snapshot() else {
@@ -4480,6 +4657,9 @@ async fn dispatch_presentation_token_action(
             extension_id,
             command,
         } => {
+            if let Some(message) = attachment.locality().blocked_command() {
+                return Ok(Some(Toast::info(message)));
+            }
             let Some(path) =
                 presentation_token_context_path(snapshot, invocation.target, view.focused())
             else {
@@ -4511,7 +4691,7 @@ async fn dispatch_presentation_token_action(
                     focused,
                     path.workspace.root.clone(),
                     path.session.trusted_project_config.clone(),
-                    socket_path.to_owned(),
+                    attachment.local_socket()?.to_owned(),
                     background_results.clone(),
                 );
                 return Ok(None);
@@ -4548,7 +4728,7 @@ async fn dispatch_presentation_token_action(
                 &command,
                 focused.child_pid,
                 host,
-                socket_path,
+                attachment.local_socket()?,
                 Some(&context),
                 None,
             )
@@ -4586,13 +4766,16 @@ async fn dispatch_client_action(
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
-    socket_path: &Path,
+    attachment: Attachment<'_>,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
     config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
     project_config_reload: &mut Option<ProjectConfigReloadState>,
     focused_terminal_was_covered: bool,
 ) -> anyhow::Result<Option<Toast>> {
+    if let Some(message) = attachment.locality().blocked_action(action) {
+        return Ok(Some(Toast::info(message)));
+    }
     match action {
         ClientAction::RunCommand(index) => {
             let Some(command) = ui.bindings.command(index) else {
@@ -4632,7 +4815,7 @@ async fn dispatch_client_action(
                     view.focused().clone(),
                     workspace_root.expect("extension command resolved workspace root"),
                     project_config,
-                    socket_path.to_owned(),
+                    attachment.local_socket()?.to_owned(),
                     background_results.clone(),
                 );
                 return Ok(None);
@@ -4676,7 +4859,7 @@ async fn dispatch_client_action(
                 &command,
                 view.focused().child_pid,
                 host,
-                socket_path,
+                attachment.local_socket()?,
                 extension_context.as_ref(),
                 None,
             )
@@ -5858,6 +6041,7 @@ enum DeltaApplyResult {
 }
 
 struct ViewState {
+    locality: Locality,
     focused: TerminalId,
     selected_revision: u64,
     panes: Vec<PaneState>,
@@ -5867,9 +6051,10 @@ struct ViewState {
 }
 
 impl ViewState {
-    fn new(selected: SelectedView) -> anyhow::Result<Self> {
+    fn new(locality: Locality, selected: SelectedView) -> anyhow::Result<Self> {
         let focused = selected.focused.terminal_id;
         let mut view = Self {
+            locality,
             focused,
             selected_revision: 0,
             panes: Vec::new(),
@@ -6537,7 +6722,7 @@ fn render_view(
                 buffer,
             );
         }
-        Screen(screen).render(*content, buffer);
+        Screen(screen, view.locality).render(*content, buffer);
         render_scrollbar(
             screen.scroll,
             *content,
@@ -6663,7 +6848,7 @@ fn render_scrollbar(
     }
 }
 
-struct Screen<'a>(&'a ScreenSnapshot);
+struct Screen<'a>(&'a ScreenSnapshot, Locality);
 
 /// Benchmark-only access to the snapshot-to-ratatui-buffer path.
 #[doc(hidden)]
@@ -6675,7 +6860,7 @@ pub mod bench {
     pub fn render_snapshot(screen: &ScreenSnapshot) -> Buffer {
         let area = Rect::new(0, 0, screen.size.columns, screen.size.rows);
         let mut buffer = Buffer::empty(area);
-        super::Screen(screen).render(area, &mut buffer);
+        super::Screen(screen, super::Locality::Local).render(area, &mut buffer);
         buffer
     }
 }
@@ -6709,7 +6894,9 @@ impl Widget for Screen<'_> {
                     }
                 };
 
-                if let Some(uri) = hyperlink_uri(screen, cell) {
+                if let Some(uri) =
+                    hyperlink_uri(screen, cell).filter(|uri| self.1.permits_link(uri))
+                {
                     let width = u16::try_from(UnicodeWidthStr::width(cell.contents.as_str()))
                         .unwrap_or(1)
                         .max(1)
@@ -7193,7 +7380,7 @@ mod tests {
             .expect("preparation cancellation signal should be delivered");
     }
 
-    fn targets(count: usize) -> Vec<SelectedTarget> {
+    pub(super) fn targets(count: usize) -> Vec<SelectedTarget> {
         let session_id = SessionId::new();
         let workspace_id = WorkspaceId::new();
         let tab_id = TabId::new();
@@ -7209,7 +7396,7 @@ mod tests {
             .collect()
     }
 
-    fn selected_view(
+    pub(super) fn selected_view(
         resource_revision: u64,
         focused: SelectedTarget,
         panes: Vec<SelectedTarget>,
@@ -7410,7 +7597,11 @@ mod tests {
         let panes = targets(2);
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         assert!(state.accept(first, snapshot(2)));
         assert!(state.accept(second, snapshot(1)));
         assert!(!state.accept(first, snapshot(1)));
@@ -7489,7 +7680,11 @@ mod tests {
     fn cursor_only_delta_updates_the_interactive_cursor_style() {
         let target = targets(1).remove(0);
         let terminal_id = target.terminal_id;
-        let mut state = ViewState::new(selected_view(1, target.clone(), vec![target])).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, target.clone(), vec![target]),
+        )
+        .unwrap();
         let size = TerminalSize {
             columns: 1,
             rows: 1,
@@ -7545,8 +7740,11 @@ mod tests {
     #[test]
     fn selected_view_revisions_only_reject_older_selected_views() {
         let panes = targets(3);
-        let mut state =
-            ViewState::new(selected_view(2, panes[0].clone(), panes[..2].to_vec())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(2, panes[0].clone(), panes[..2].to_vec()),
+        )
+        .unwrap();
 
         assert!(
             state
@@ -7581,7 +7779,7 @@ mod tests {
         };
         let mut accepted = initial.clone();
         accepted.resource_revision = 2;
-        let mut state = ViewState::new(initial).unwrap();
+        let mut state = ViewState::new(Locality::Local, initial).unwrap();
         let optimistic = SplitRatio::from_cells(1, 3).unwrap();
         let authoritative = SplitRatio::from_cells(2, 3).unwrap();
 
@@ -7599,8 +7797,11 @@ mod tests {
         panes[1].tab_id = TabId::new();
         let old_terminal = panes[0].terminal_id;
         let request_id = Uuid::new_v4();
-        let mut state =
-            ViewState::new(selected_view(1, panes[0].clone(), vec![panes[0].clone()])).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), vec![panes[0].clone()]),
+        )
+        .unwrap();
         state.mark_resize_requested(old_terminal, request_id);
 
         state
@@ -7617,16 +7818,21 @@ mod tests {
         let panes = targets(2);
         let mut inconsistent = panes[0].clone();
         inconsistent.child_pid += 100;
-        assert!(ViewState::new(selected_view(1, inconsistent, panes.clone())).is_err());
+        assert!(
+            ViewState::new(
+                Locality::Local,
+                selected_view(1, inconsistent, panes.clone())
+            )
+            .is_err()
+        );
 
         let mut duplicate = panes[1].clone();
         duplicate.pane_id = panes[0].pane_id;
         assert!(
-            ViewState::new(selected_view(
-                1,
-                panes[0].clone(),
-                vec![panes[0].clone(), duplicate],
-            ))
+            ViewState::new(
+                Locality::Local,
+                selected_view(1, panes[0].clone(), vec![panes[0].clone(), duplicate],)
+            )
             .is_err()
         );
     }
@@ -7636,7 +7842,11 @@ mod tests {
         let panes = targets(2);
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(0, 0, 38, 4);
         assert_eq!(
             state.resize_requests(area, PaneLayoutPolicy::Accordion),
@@ -7695,7 +7905,11 @@ mod tests {
     #[test]
     fn pane_hit_testing_returns_the_typed_target_and_terminal_local_cell() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 49, 8);
         let layouts = state.pane_layouts(area, PaneLayoutPolicy::Splits).0;
 
@@ -7719,7 +7933,11 @@ mod tests {
     fn mouse_selection_defers_to_application_tracking_unless_shift_overrides_it() {
         let panes = targets(1);
         let terminal_id = panes[0].terminal_id;
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 20, 8);
         let mut screen = ScreenSnapshot::new(
             1,
@@ -7781,7 +7999,11 @@ mod tests {
     #[test]
     fn crossterm_wheel_is_hit_tested_and_normalized_for_the_terminal_protocol() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 49, 8);
         let content =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
@@ -7821,7 +8043,11 @@ mod tests {
     #[test]
     fn unfocused_left_click_focuses_and_swallows_the_complete_initiating_gesture() {
         let panes = targets(2);
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(0, 0, 49, 8);
         let content =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
@@ -7886,7 +8112,11 @@ mod tests {
     #[test]
     fn focused_drag_is_captured_clamped_and_modal_mouse_is_discarded() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 49, 8);
         let content =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[0].terminal_id].content;
@@ -8021,7 +8251,11 @@ mod tests {
     #[test]
     fn per_button_capture_derives_destination_buttons_and_orders_synthetic_releases() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 49, 8);
         let layouts = state.pane_layouts(area, PaneLayoutPolicy::Splits).0;
         let focused = layouts[&panes[0].terminal_id].content;
@@ -8169,7 +8403,11 @@ mod tests {
     #[test]
     fn real_release_updates_capture_before_forwarding_and_clears_only_after_send() {
         let panes = targets(1);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(7, 3, 20, 8);
         let content =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[0].terminal_id].content;
@@ -8230,7 +8468,11 @@ mod tests {
     #[test]
     fn failed_focus_gesture_stays_suppressed_without_replay() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let area = Rect::new(0, 0, 49, 8);
         let background =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
@@ -8289,7 +8531,11 @@ mod tests {
     #[test]
     fn ui_drag_ownership_is_left_only_stable_and_release_uses_the_final_cell() {
         let panes = targets(3);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let host = Rect::new(0, 0, 100, 30);
         let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
         let divider = dividers[0];
@@ -8353,7 +8599,11 @@ mod tests {
     #[test]
     fn authoritative_topology_change_cancels_a_stale_split_drag() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let host = Rect::new(0, 0, 80, 23);
         let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
         let divider = dividers[0];
@@ -8385,7 +8635,11 @@ mod tests {
     #[test]
     fn ui_drag_waits_until_every_application_mouse_button_is_idle() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let host = Rect::new(0, 0, 80, 23);
         let (layouts, dividers) = state.pane_layouts(host, PaneLayoutPolicy::Splits);
         let content = layouts[&panes[0].terminal_id].content;
@@ -8457,7 +8711,11 @@ mod tests {
     #[test]
     fn sidebar_drags_are_side_specific_and_resize_from_their_own_edge() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let host = Rect::new(0, 0, 140, 24);
         let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
         let pane_divider = dividers[0];
@@ -8586,7 +8844,11 @@ mod tests {
     #[test]
     fn terminal_originated_drag_never_turns_into_a_divider_drag() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         let host = Rect::new(0, 0, 80, 23);
         let (layouts, dividers) = state.pane_layouts(host, PaneLayoutPolicy::Splits);
         let content = layouts[&panes[0].terminal_id].content;
@@ -8636,7 +8898,11 @@ mod tests {
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
         let area = Rect::new(0, 0, 38, 4);
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
 
         assert!(!state.is_zoomed());
         assert_eq!(
@@ -8722,7 +8988,11 @@ mod tests {
             )
             .unwrap()
         };
-        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
         assert!(state.accept(first, snapshot("A", 13)));
         assert!(state.accept(second, snapshot("B", 12)));
 
@@ -8898,7 +9168,7 @@ mod tests {
         );
     }
 
-    fn linked_screen(text: &str, uri: &str) -> ScreenSnapshot {
+    pub(super) fn linked_screen(text: &str, uri: &str) -> ScreenSnapshot {
         let mut screen = ScreenSnapshot::new(
             1,
             TerminalSize {

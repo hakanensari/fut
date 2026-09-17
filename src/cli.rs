@@ -71,6 +71,13 @@ use crate::{
     after_help = "Enable shell completion with, for example: source <(COMPLETE=zsh fut)"
 )]
 pub struct Cli {
+    /// Attach to an existing remote daemon via an SSH config host (opens navigator).
+    ///
+    /// Supports only bare attachment or `attach`, with an exact protocol match.
+    /// Never starts, stops, or replaces the remote daemon. UI configuration is local.
+    /// Commands, project opening, config reload, and client hooks are unavailable remotely.
+    #[arg(long, global = true, value_name = "HOST", conflicts_with_all = ["socket", "json"])]
+    remote: Option<String>,
     /// Override the Unix socket used to contact the daemon.
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
@@ -84,7 +91,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     json: bool,
     /// Launch the standalone UI playground without starting or contacting a daemon.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "remote")]
     ui_playground: bool,
     /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
@@ -123,6 +130,9 @@ where
 
 #[derive(Subcommand)]
 enum Command {
+    /// Forward the selected daemon socket over stdio for an SSH attachment.
+    #[command(name = "__stdio-bridge", hide = true)]
+    StdioBridge,
     /// Attach to an existing daemon with the global navigator open.
     #[command(alias = "a")]
     Attach {
@@ -937,6 +947,10 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             return ExitCode::from(code as u8);
         }
     };
+    if let Err(error) = validate_remote_cli(&cli) {
+        eprintln!("Error: {error:#}");
+        return ExitCode::FAILURE;
+    }
     let json_output = cli.json;
     if let Some(Command::Trust {
         command: Some(TrustCommand::Status { path }),
@@ -1014,13 +1028,48 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
+fn validate_remote_cli(cli: &Cli) -> Result<()> {
+    if let Some(host) = &cli.remote {
+        crate::ssh_bridge::validate_destination(host)?;
+        match cli.command {
+            None
+            | Some(Command::Attach {
+                ignore_protocol_mismatch: false,
+            }) => {}
+            Some(Command::Attach {
+                ignore_protocol_mismatch: true,
+            }) => {
+                bail!(
+                    "--remote requires an exact protocol match; --ignore-protocol-mismatch is unavailable"
+                );
+            }
+            _ => bail!(
+                "--remote supports only bare attachment or `attach`; remote open/start and other commands are unavailable"
+            ),
+        }
+    }
+    Ok(())
+}
+
 async fn execute(cli: Cli) -> Result<()> {
+    if let Some(host) = &cli.remote {
+        reject_nested_client(&cli)?;
+        return client::attach_remote(host, &cli.config_location()?).await;
+    }
+
     if cli.ui_playground {
         if cli.command.is_some() {
             bail!("--ui-playground cannot be combined with a command");
         }
         reject_interactive_json(&cli)?;
         return client::launch_ui_playground(&cli.config_location()?).await;
+    }
+
+    if matches!(cli.command, Some(Command::StdioBridge)) {
+        let socket = socket_path(cli.socket.as_deref())?;
+        return tokio::task::spawn_blocking(move || crate::ssh_bridge::run_stdio(&socket))
+            .await
+            .context("join stdio bridge")?;
     }
 
     if matches!(
@@ -1102,6 +1151,7 @@ async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
     reject_nested_client(&cli)?;
     match cli.command {
+        Some(Command::StdioBridge) => unreachable!("stdio bridge is handled before config loading"),
         None => {
             let current_dir = std::env::current_dir().context("read current directory")?;
             let (cwd, project_name, recipe_project) =
@@ -4482,6 +4532,40 @@ fn unexpected<T>(message: ServerMessage) -> Result<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_cli_accepts_only_standalone_navigator_attachment() {
+        for args in [
+            vec!["fut", "--remote", "clonk"],
+            vec!["fut", "--remote", "clonk", "attach"],
+            vec!["fut", "a", "--remote", "clonk", "--no-config"],
+        ] {
+            validate_remote_cli(&try_parse_cli_from(args).unwrap()).unwrap();
+        }
+        for tail in [
+            vec!["attach", "--ignore-protocol-mismatch"],
+            vec!["open", "/tmp"],
+            vec!["daemon", "run"],
+            vec!["daemon", "shutdown", "--force"],
+            vec!["list"],
+            vec!["doctor"],
+            vec!["trust", "status"],
+            vec!["trust", "/tmp"],
+            vec!["untrust", "/tmp"],
+            vec!["extension", "install", "/tmp"],
+            vec!["__stdio-bridge"],
+            vec!["session", "attach", "name"],
+            vec!["--socket", "/tmp/fut.sock"],
+            vec!["--json"],
+            vec!["--ui-playground"],
+        ] {
+            let mut args = vec!["fut", "--remote", "clonk"];
+            args.extend(tail);
+            if let Ok(cli) = try_parse_cli_from(args.clone()) {
+                assert!(validate_remote_cli(&cli).is_err(), "{args:?}");
+            }
+        }
+    }
+
     fn empty_extension_catalog() -> crate::protocol::ExtensionCatalog {
         crate::protocol::ExtensionCatalog {
             generation: 1,
@@ -5646,6 +5730,7 @@ mod tests {
         let command = cli_command();
         let names: Vec<_> = command
             .get_subcommands()
+            .filter(|command| !command.is_hide_set())
             .map(clap::Command::get_name)
             .collect();
         assert_eq!(

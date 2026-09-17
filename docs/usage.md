@@ -51,6 +51,40 @@ cause the client to fail.
 Fut refuses to start a nested interactive client inside one of its terminals.
 If nesting is intentional, run `FUT_ALLOW_NESTED=1 fut`.
 
+## Attach to a remote machine
+
+Run Fut's interface locally while its daemon and terminals remain on an SSH
+host:
+
+```sh
+fut --remote workbox
+```
+
+`workbox` is a host or alias accepted by OpenSSH. Fut uses the normal SSH
+configuration, authentication, host keys, and jump hosts, then opens the global
+navigator for the remote daemon. `fut --remote workbox attach` is equivalent.
+The local process renders the interface and uses the local theme, keybindings,
+and clipboard; SSH carries the Fut protocol to the remote daemon without
+exposing a network listener.
+
+The same Fut version must already be installed on the remote host and its daemon
+must already be running. For example, connect normally once, start Fut, and
+detach before using the local client:
+
+```sh
+ssh workbox
+fut
+# Ctrl-b d, then exit SSH
+fut --remote workbox
+```
+
+Remote attachment is initially attach-only: it never starts, stops, upgrades,
+or replaces the remote daemon. Project opening, configuration reload, configured
+commands, extension command actions, and client lifecycle hooks are unavailable
+because they currently assume the client and daemon share a filesystem. Remote
+terminal links are limited to HTTP and HTTPS. Ordinary terminal input,
+navigation, layout actions, copy mode, and pane links continue to work.
+
 For Git repositories, Fut groups linked worktrees from the same repository as
 peer workspaces in one session. Ordinary directories get their own session.
 Opening the same location again reuses it; bare Git repositories are not valid

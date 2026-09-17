@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "ssh_bridge/mod.rs"]
+mod ssh_bridge_tests;
+
 use std::{
     collections::HashMap,
     fs,
