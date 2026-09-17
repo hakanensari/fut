@@ -1,5 +1,5 @@
 //! Execution locality is independent of the transport's socket representation.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{actions::ClientAction, config::UiConfig};
 use crate::protocol::remote::Capabilities;
@@ -10,23 +10,23 @@ pub(super) enum Locality {
     Remote,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Attachment<'a> {
-    Local(&'a Path),
+#[derive(Clone, Debug)]
+pub(super) enum Attachment {
+    Local(PathBuf),
     Remote(Capabilities),
 }
 
-impl<'a> Attachment<'a> {
-    pub(super) fn locality(self) -> Locality {
+impl Attachment {
+    pub(super) fn locality(&self) -> Locality {
         match self {
             Self::Local(_) => Locality::Local,
             Self::Remote(_) => Locality::Remote,
         }
     }
 
-    pub(super) fn local_socket(self) -> anyhow::Result<&'a Path> {
+    pub(super) fn local_socket(&self) -> anyhow::Result<&Path> {
         match self {
-            Self::Local(path) => Ok(path),
+            Self::Local(path) => Ok(path.as_path()),
             Self::Remote(_) => anyhow::bail!("local commands unavailable during remote attachment"),
         }
     }
@@ -62,11 +62,11 @@ impl Locality {
     }
 }
 
-impl Attachment<'_> {
+impl Attachment {
     // Phase 1 disables client hooks entirely on remote attachments. Even locally
     // installed hooks assume local FUT_SOCKET and resource context today.
     pub(super) fn client_hooks(
-        self,
+        &self,
         ui: &UiConfig,
     ) -> anyhow::Result<Option<crate::extensions::ClientHookRuntime>> {
         match self {

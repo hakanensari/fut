@@ -75,7 +75,9 @@ fields = [{ name = 'value', label = 'Value' }]
             .is_err()
     );
     assert_eq!(
-        Attachment::Local(root.path()).local_socket().unwrap(),
+        Attachment::Local(root.path().to_owned())
+            .local_socket()
+            .unwrap(),
         root.path()
     );
 
@@ -157,7 +159,9 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &mut ui,
             &mut temporary,
-            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            None,
+            federation::MachineId::Local,
             &background,
             &location,
             &mut reload,
@@ -193,7 +197,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
             &background,
         )
         .await
@@ -228,7 +232,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
             &background,
         )
         .await

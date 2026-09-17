@@ -7,6 +7,7 @@ use std::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::Path,
+    process::Stdio,
     time::Duration,
 };
 
@@ -14,12 +15,18 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::{net::UnixStream, time};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    net::UnixStream,
+    process::Command,
+    time,
+};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::{
     client::config,
+    machines::Catalog,
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
@@ -292,6 +299,10 @@ pub async fn run(socket: &Path, location: &config::ConfigLocation) -> DoctorRepo
         ));
     }
 
+    checks.push(openssh_check().await);
+    checks.push(saved_machines_check());
+    checks.push(remote_endpoints_check().await);
+
     let (preset, glyphs) = configured_icons.unwrap_or_else(|| ("unknown", Vec::new()));
     let nerd_font = preset == "nerd_font";
     checks.push(check(
@@ -489,6 +500,331 @@ fn unavailable_extensions_check(summary: &str) -> DoctorCheck {
     check("extensions", CheckStatus::Info, summary.into(), Value::Null)
 }
 
+const OPENSSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_OPENSSH_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_OPENSSH_IDENTITY_BYTES: usize = 256;
+const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 1024;
+
+async fn openssh_check() -> DoctorCheck {
+    probe_openssh(Path::new("ssh"), OPENSSH_PROBE_TIMEOUT).await
+}
+
+async fn probe_openssh(program: &Path, deadline: Duration) -> DoctorCheck {
+    let mut command = Command::new(program);
+    command
+        .arg("-V")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let error = bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES);
+            return check(
+                "ssh",
+                CheckStatus::Error,
+                "OpenSSH executable is unavailable".into(),
+                json!({ "available": false, "error": error }),
+            );
+        }
+        Err(error) => {
+            let error = bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES);
+            return check(
+                "ssh",
+                CheckStatus::Error,
+                format!("cannot start OpenSSH executable: {error}"),
+                json!({ "available": false, "error": error }),
+            );
+        }
+    };
+    let stdout = child.stdout.take().expect("piped OpenSSH stdout");
+    let stderr = child.stderr.take().expect("piped OpenSSH stderr");
+    let result = time::timeout(deadline, async {
+        tokio::join!(
+            child.wait(),
+            read_bounded(stdout, MAX_OPENSSH_OUTPUT_BYTES),
+            read_bounded(stderr, MAX_OPENSSH_OUTPUT_BYTES),
+        )
+    })
+    .await;
+    let (status, stdout, stderr) = match result {
+        Ok((Ok(status), Ok(stdout), Ok(stderr))) => (status, stdout, stderr),
+        Ok((status, stdout, stderr)) => {
+            let error = status
+                .err()
+                .or_else(|| stdout.err())
+                .or_else(|| stderr.err())
+                .expect("at least one OpenSSH probe operation failed");
+            let error = bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES);
+            return check(
+                "ssh",
+                CheckStatus::Error,
+                format!("OpenSSH version probe failed: {error}"),
+                json!({ "available": true, "error": error }),
+            );
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = time::timeout(Duration::from_millis(100), child.wait()).await;
+            return check(
+                "ssh",
+                CheckStatus::Error,
+                "OpenSSH version probe timed out".into(),
+                json!({ "available": true, "timed_out": true }),
+            );
+        }
+    };
+
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let is_openssh = stdout_text.contains("OpenSSH") || stderr_text.contains("OpenSSH");
+    let identity = stderr_text
+        .lines()
+        .chain(stdout_text.lines())
+        .find(|line| !line.trim().is_empty())
+        .map(|line| bounded_safe_text(line.trim(), MAX_OPENSSH_IDENTITY_BYTES));
+    let successful = status.success() && is_openssh;
+    let summary = if successful {
+        match identity.as_deref() {
+            Some(identity) => format!("OpenSSH available: {identity}"),
+            None => "OpenSSH is available".into(),
+        }
+    } else if !status.success() {
+        format!(
+            "OpenSSH version probe exited with status {}",
+            status
+                .code()
+                .map_or_else(|| "unknown".into(), |code| code.to_string())
+        )
+    } else {
+        "ssh executable did not identify itself as OpenSSH".into()
+    };
+    check(
+        "ssh",
+        if successful {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Error
+        },
+        summary,
+        json!({
+            "available": true,
+            "openssh": is_openssh,
+            "identity": identity,
+            "exit_code": status.code(),
+            "output_truncated": stdout.truncated || stderr.truncated,
+        }),
+    )
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded(
+    mut reader: impl AsyncRead + Unpin,
+    maximum: usize,
+) -> std::io::Result<BoundedOutput> {
+    let mut bytes = Vec::with_capacity(maximum);
+    let mut truncated = false;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = maximum.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    Ok(BoundedOutput { bytes, truncated })
+}
+
+fn saved_machines_check() -> DoctorCheck {
+    match Catalog::resolve() {
+        Ok(catalog) => machine_catalog_check(&catalog),
+        Err(error) => {
+            let error = bounded_safe_text(&format!("{error:#}"), MAX_DIAGNOSTIC_TEXT_BYTES);
+            check(
+                "machines",
+                CheckStatus::Error,
+                format!("cannot resolve saved machine catalog: {error}"),
+                json!({ "error": error }),
+            )
+        }
+    }
+}
+
+async fn remote_endpoints_check() -> DoctorCheck {
+    let catalog = match Catalog::resolve().and_then(|catalog| catalog.list()) {
+        Ok(machines) => machines,
+        Err(error) => {
+            return check(
+                "remote_endpoints",
+                CheckStatus::Info,
+                "remote compatibility skipped because the saved machine catalog is invalid".into(),
+                json!({ "error": bounded_safe_text(&format!("{error:#}"), MAX_DIAGNOSTIC_TEXT_BYTES) }),
+            );
+        }
+    };
+    let enabled = catalog
+        .into_iter()
+        .filter(|machine| machine.enabled)
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return check(
+            "remote_endpoints",
+            CheckStatus::Info,
+            "no enabled saved machines to probe".into(),
+            json!({ "contacted": 0, "concurrency": 4 }),
+        );
+    }
+    let total = enabled.len();
+    let results = futures_util::stream::iter(enabled.into_iter().map(|machine| async move {
+        if let Err(error) = probe_ssh_config(&machine.target).await {
+            return json!({
+                "id": machine.id,
+                "label": safe_text(&machine.label),
+                "target": safe_text(&machine.target),
+                "status": "ssh_config_error",
+                "error": error,
+            });
+        }
+        let result = time::timeout(
+            Duration::from_secs(6),
+            crate::client::diagnose_remote(&machine.target),
+        )
+        .await;
+        match result {
+            Ok(Ok(server_version)) => json!({
+                "id": machine.id,
+                "label": safe_text(&machine.label),
+                "target": safe_text(&machine.target),
+                "status": "compatible",
+                "server_version": safe_text(&server_version),
+            }),
+            Ok(Err(error)) => json!({
+                "id": machine.id,
+                "label": safe_text(&machine.label),
+                "target": safe_text(&machine.target),
+                "status": "error",
+                "error": bounded_safe_text(&format!("{error:#}"), MAX_DIAGNOSTIC_TEXT_BYTES),
+            }),
+            Err(_) => json!({
+                "id": machine.id,
+                "label": safe_text(&machine.label),
+                "target": safe_text(&machine.target),
+                "status": "timeout",
+                "error": "bounded compatibility probe timed out",
+            }),
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    let compatible = results
+        .iter()
+        .filter(|result| result["status"] == "compatible")
+        .count();
+    check(
+        "remote_endpoints",
+        if compatible == total {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Error
+        },
+        format!("{compatible} of {total} enabled saved machines are compatible"),
+        json!({ "contacted": total, "compatible": compatible, "concurrency": 4, "profiles": results }),
+    )
+}
+
+async fn probe_ssh_config(target: &str) -> Result<(), String> {
+    let mut command = Command::new("ssh");
+    command
+        .args(["-G", "--", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES))?;
+    let stderr = child.stderr.take().expect("piped SSH config stderr");
+    let result = time::timeout(Duration::from_millis(500), async {
+        tokio::join!(child.wait(), read_bounded(stderr, MAX_OPENSSH_OUTPUT_BYTES))
+    })
+    .await;
+    match result {
+        Ok((Ok(status), Ok(_))) if status.success() => Ok(()),
+        Ok((status, stderr)) => {
+            let message = match (status, stderr) {
+                (Ok(status), Ok(stderr)) => format!(
+                    "ssh -G exited with status {}: {}",
+                    status
+                        .code()
+                        .map_or_else(|| "unknown".into(), |code| code.to_string()),
+                    String::from_utf8_lossy(&stderr.bytes),
+                ),
+                (Err(error), _) | (_, Err(error)) => error.to_string(),
+            };
+            Err(bounded_safe_text(&message, MAX_DIAGNOSTIC_TEXT_BYTES))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = time::timeout(Duration::from_millis(100), child.wait()).await;
+            Err("ssh -G configuration probe timed out".into())
+        }
+    }
+}
+
+fn machine_catalog_check(catalog: &Catalog) -> DoctorCheck {
+    let path = bounded_safe_text(&path_text(catalog.path()), MAX_DIAGNOSTIC_TEXT_BYTES);
+    match catalog.list() {
+        Ok(machines) => {
+            let enabled = machines.iter().filter(|machine| machine.enabled).count();
+            let disabled = machines.len() - enabled;
+            let profiles = machines
+                .iter()
+                .map(|machine| {
+                    json!({
+                        "id": machine.id,
+                        "label": safe_text(&machine.label),
+                        "target": safe_text(&machine.target),
+                        "enabled": machine.enabled,
+                    })
+                })
+                .collect::<Vec<_>>();
+            check(
+                "machines",
+                CheckStatus::Ok,
+                format!(
+                    "valid saved machine catalog; {} profile{} ({enabled} enabled, {disabled} disabled)",
+                    machines.len(),
+                    if machines.len() == 1 { "" } else { "s" },
+                ),
+                json!({
+                    "path": path,
+                    "count": machines.len(),
+                    "enabled": enabled,
+                    "disabled": disabled,
+                    "profiles": profiles,
+                }),
+            )
+        }
+        Err(error) => {
+            let error = bounded_safe_text(&format!("{error:#}"), MAX_DIAGNOSTIC_TEXT_BYTES);
+            check(
+                "machines",
+                CheckStatus::Error,
+                format!("saved machine catalog is invalid: {error}"),
+                json!({ "path": path, "error": error }),
+            )
+        }
+    }
+}
+
 fn check(id: &'static str, status: CheckStatus, summary: String, details: Value) -> DoctorCheck {
     DoctorCheck {
         id,
@@ -532,8 +868,34 @@ fn safe_text(value: &str) -> String {
         .collect()
 }
 
+fn bounded_safe_text(value: &str, maximum_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let character = if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            ) {
+            '�'
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > maximum_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     use super::*;
 
     fn empty_extension_catalog() -> crate::protocol::ExtensionCatalog {
@@ -591,6 +953,118 @@ mod tests {
         assert_eq!(extensions.details["generation"], 1);
         assert_eq!(extensions.details["count"], 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn openssh_probe_reports_missing_binary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let check = probe_openssh(
+            &temporary.path().join("missing-ssh"),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(check.status, CheckStatus::Error);
+        assert_eq!(check.summary, "OpenSSH executable is unavailable");
+        assert_eq!(check.details["available"], false);
+    }
+
+    #[tokio::test]
+    async fn openssh_probe_is_bounded_and_sanitizes_its_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ssh = temporary.path().join("ssh");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\nprintf 'OpenSSH_9.9\\033[31m\\n' >&2\ni=0\nwhile [ $i -lt 5000 ]; do printf x >&2; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let check = probe_openssh(&ssh, Duration::from_secs(1)).await;
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.details["openssh"], true);
+        assert_eq!(check.details["output_truncated"], true);
+        assert_eq!(check.details["identity"], "OpenSSH_9.9�[31m");
+        assert!(!check.summary.contains('\u{1b}'));
+        assert!(check.summary.len() <= MAX_OPENSSH_IDENTITY_BYTES + 20);
+    }
+
+    #[tokio::test]
+    async fn openssh_probe_times_out_without_waiting_for_the_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ssh = temporary.path().join("ssh");
+        fs::write(&ssh, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let check = probe_openssh(&ssh, Duration::from_millis(20)).await;
+
+        assert_eq!(check.status, CheckStatus::Error);
+        assert_eq!(check.summary, "OpenSSH version probe timed out");
+        assert_eq!(check.details["available"], true);
+        assert_eq!(check.details["timed_out"], true);
+    }
+
+    #[test]
+    fn machine_catalog_reports_enabled_and_disabled_profiles_without_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("machines.toml");
+        let contents = format!(
+            r#"version = 1
+
+[[machines]]
+id = "{}"
+label = "work"
+target = "alice@work.example"
+enabled = true
+
+[[machines]]
+id = "{}"
+label = "home"
+target = "home.example"
+enabled = false
+"#,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        fs::write(&path, &contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let check = machine_catalog_check(&Catalog::at(&path));
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.details["count"], 2);
+        assert_eq!(check.details["enabled"], 1);
+        assert_eq!(check.details["disabled"], 1);
+        assert_eq!(check.details["profiles"][0]["label"], "work");
+        assert_eq!(check.details["profiles"][1]["enabled"], false);
+        assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn machine_catalog_reports_profile_validation_errors_without_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("machines.toml");
+        let contents = format!(
+            r#"version = 1
+
+[[machines]]
+id = "{}"
+label = "work"
+target = "-not-an-ssh-destination"
+enabled = true
+"#,
+            Uuid::new_v4(),
+        );
+        fs::write(&path, &contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let check = machine_catalog_check(&Catalog::at(&path));
+
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(check.summary.contains("SSH destination must not start"));
+        assert!(check.details["profiles"].is_null());
+        assert_eq!(fs::read_to_string(path).unwrap(), contents);
     }
 
     #[test]

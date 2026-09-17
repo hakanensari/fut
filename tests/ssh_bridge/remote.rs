@@ -1,5 +1,6 @@
 use super::*;
 use fut::protocol::remote::{self as wire, EndpointError, RemoteHello};
+use uuid::Uuid;
 
 fn fake_ssh(root: &std::path::Path) -> PathBuf {
     let bin = root.join("fake-bin");
@@ -15,7 +16,14 @@ if [ -n "$SSH_FAILURE" ]; then
     printf '%s\n' "$SSH_FAILURE" >&2
     exit 255
 fi
-exec "$FUT_BIN" --socket "$REMOTE_SOCKET" __stdio-bridge
+socket="$REMOTE_SOCKET"
+for argument in "$@"; do
+    case "$argument" in
+        alpha) socket="$REMOTE_SOCKET_ALPHA" ;;
+        beta) socket="$REMOTE_SOCKET_BETA" ;;
+    esac
+done
+exec "$FUT_BIN" --socket "$socket" __stdio-bridge
 "#,
     )
     .unwrap();
@@ -120,6 +128,76 @@ argv = ["./run"]
         ServerMessage::Pong { .. }
     ));
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_client_switches_atomically_between_two_saved_remote_endpoints() {
+    let local = Harness::start("printf 'LOCAL_READY\\r\\n'; while IFS= read -r line; do printf 'LOCAL:%s\\r\\n' \"$line\"; done").await;
+    let alpha = Harness::start("printf 'ALPHA_READY\\r\\n'; while IFS= read -r line; do printf 'ALPHA:%s\\r\\n' \"$line\"; done").await;
+    let beta = Harness::start("printf 'BETA_READY\\r\\n'; while IFS= read -r line; do printf 'BETA:%s\\r\\n' \"$line\"; done").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let state = root.path().join("state/fut");
+    fs::create_dir_all(&state).unwrap();
+    let machines = format!(
+        "version = 1\n\n[[machines]]\nid = \"{}\"\nlabel = \"alpha\"\ntarget = \"alpha\"\nenabled = true\n\n[[machines]]\nid = \"{}\"\nlabel = \"beta\"\ntarget = \"beta\"\nenabled = true\n",
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let catalog = state.join("machines.toml");
+    fs::write(&catalog, machines).unwrap();
+    fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &alpha.socket);
+    command
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("REMOTE_SOCKET_ALPHA", &alpha.socket)
+        .env("REMOTE_SOCKET_BETA", &beta.socket)
+        .args(script_command_args())
+        .arg(format!(
+            "stty cols 80 rows 24; exec \"$FUT_BIN\" --no-config --socket {} attach",
+            local.socket.display()
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("navigator").await;
+    client.send(b"\r");
+    client.wait_for("LOCAL_READY").await;
+
+    client.send(b"\x02s");
+    client.wait_for("alpha · Online").await;
+    client.send(b"alpha\r");
+    client.wait_for("ALPHA_READY").await;
+    client.send(b"one\r");
+    client.wait_for("ALPHA:one").await;
+
+    client.send(b"\x02s");
+    client.wait_for("beta · Online").await;
+    client.send(b"beta\r");
+    client.wait_for("BETA_READY").await;
+    client.send(b"two\r");
+    client.wait_for("BETA:two").await;
+    assert!(!client.text().contains("ALPHA:two"), "{}", client.text());
+    assert!(!client.text().contains("LOCAL:two"), "{}", client.text());
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    assert!(matches!(
+        local.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    assert!(matches!(
+        alpha.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    assert!(matches!(
+        beta.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    local.shutdown().await;
+    alpha.shutdown().await;
+    beta.shutdown().await;
 }
 
 #[tokio::test]

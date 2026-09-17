@@ -43,6 +43,17 @@ per-client clone and row diff → compact
 MessagePack full snapshot or dirty-row delta → client apply → 16 ms paced draw
 with per-pane dirty revisions and CSI 2026 (`client/mod.rs`).
 
+Federation metadata uses one bounded control connection per enabled profile.
+Its measured protocol surface is one hello/welcome, one resource subscription,
+an optional alert subscription, complete metadata updates only when their
+daemon-local revision advances, and one health exchange every 15 seconds.
+The metadata decoder intentionally has no screen or screen-delta variant;
+terminal output therefore adds **0 screen frames** and **0 screen bytes** to a
+background endpoint connection. The fixed profile fixture is bounded to 256
+profiles, 128 queued supervisor events, 8 MiB per framed message, and retry
+delays of 1–30 seconds. `client::federation_transport` tests measure message
+classes at this boundary and reject a screen frame as a compatibility failure.
+
 The client loop is already shaped right (paced, dirty-gated, synchronized
 output). Remaining costs for observed terminals are upstream, ranked:
 

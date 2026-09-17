@@ -11,11 +11,16 @@ use ratatui::{
 use super::{
     chrome::sanitize,
     config::{AgentScope, SemanticStyle, SpinnerConfig},
+    federation::{Generation, MachineId},
     notifications::{ActivityIndicator, NotificationState},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AgentItem {
+    pub machine: MachineId,
+    pub generation: Generation,
+    pub machine_label: Option<String>,
+    pub selectable: bool,
     pub terminal_id: TerminalId,
     pub pane_id: PaneId,
     pub session: String,
@@ -39,7 +44,8 @@ impl AgentItem {
 
     pub(super) fn search_text(&self) -> String {
         format!(
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
+            self.machine_label.as_deref().unwrap_or(""),
             self.source,
             self.status(),
             self.session,
@@ -81,13 +87,16 @@ impl AgentItem {
             Span::styled(self.status(), status_style),
             Span::styled(
                 format!(
-                    " · {}",
+                    " · {}{}",
                     [
                         self.session.as_str(),
                         self.workspace.as_str(),
                         self.tab.as_str(),
                     ]
-                    .join(path_separator)
+                    .join(path_separator),
+                    self.machine_label
+                        .as_deref()
+                        .map_or_else(String::new, |machine| format!(" · {machine}")),
                 ),
                 detail_style,
             ),
@@ -113,6 +122,10 @@ pub(super) fn items(
         .pane_paths()
         .filter(|path| in_scope(*path, focused_ancestry, scope))
         .map(|path| AgentItem {
+            machine: MachineId::Local,
+            generation: Generation::default(),
+            machine_label: None,
+            selectable: true,
             terminal_id: path.pane.terminal_id,
             pane_id: path.pane.id,
             session: sanitize(&path.session.name),

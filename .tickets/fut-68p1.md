@@ -1,6 +1,6 @@
 ---
 id: fut-68p1
-status: open
+status: closed
 deps: [fut-hpia]
 links: []
 created: 2026-09-15T13:21:57Z

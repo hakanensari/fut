@@ -8,7 +8,8 @@ permalink: /doctor/
 # Diagnostics
 
 > **TL;DR:** Run `fut doctor`. It safely checks configuration, terminal
-> capabilities, runtime permissions, daemon compatibility, and icons without
+> capabilities, runtime permissions, daemon and saved-machine compatibility,
+> and icons without
 > starting or changing anything.
 
 `fut doctor` performs a bounded, read-only diagnosis of the client environment:
@@ -33,7 +34,18 @@ Doctor reports:
 - a bounded Fut protocol handshake when a safe socket exists;
 - the active daemon extension generation, fingerprint, package count, manifest
   metadata, canonical roots, and configuration provenance;
+- whether the `ssh` executable identifies itself as OpenSSH;
+- saved-machine catalog validity and enabled/disabled profile summaries;
+- a bounded, non-interactive compatibility handshake to each enabled saved
+  machine, with at most four probes in flight;
 - the configured icon preset and a visual glyph probe.
+
+Remote probes use `BatchMode=yes` and strict host-key checking. They do not
+prompt, accept host keys, edit SSH configuration, write the machine catalog,
+start or stop a daemon, or lease a terminal. A profile can therefore report an
+authentication, host-key, installation, timeout, or protocol error that must be
+repaired with ordinary OpenSSH and Fut commands outside doctor. Every probe
+closes and reaps its SSH process before the report completes.
 
 Released client and daemon protocol versions must match exactly. Compatible
 source changes keep the current release's protocol during development. The

@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+: "${FUT_REAL_SSH_TARGET:?set FUT_REAL_SSH_TARGET to an already trusted SSH target running a Fut daemon}"
+
+root=$(mktemp -d "${TMPDIR:-/tmp}/fut-remote-smoke.XXXXXX")
+cleanup() {
+  rm -rf -- "$root"
+}
+trap cleanup EXIT HUP INT TERM
+
+binary=${FUT_BIN:-target/debug/fut}
+if [ ! -x "$binary" ]; then
+  cargo build --locked --bin fut
+fi
+
+export XDG_STATE_HOME="$root/state"
+export XDG_CONFIG_HOME="$root/config"
+export XDG_RUNTIME_DIR="$root/runtime"
+mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+
+"$binary" machine add "$FUT_REAL_SSH_TARGET" --label remote-smoke
+set +e
+report=$("$binary" --json doctor 2>/dev/null)
+set -e
+printf '%s\n' "$report" | grep -q '"remote_endpoints"'
+printf '%s\n' "$report" | grep -q '"status":"compatible"'
+
+# Both machine verification and doctor own and reap their OpenSSH children.
+if command -v pgrep >/dev/null 2>&1 && pgrep -P $$ ssh >/dev/null 2>&1; then
+  echo "remote smoke left an SSH child running" >&2
+  exit 1
+fi
+
+echo "remote SSH smoke passed for $FUT_REAL_SSH_TARGET"

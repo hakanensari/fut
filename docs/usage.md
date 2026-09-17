@@ -53,6 +53,13 @@ If nesting is intentional, run `FUT_ALLOW_NESTED=1 fut`.
 
 ## Attach to a remote machine
 
+There are two distinct SSH workflows:
+
+- `ssh -t workbox fut` runs both Fut's client and daemon on `workbox`; the SSH
+  session owns terminal integration and clipboard availability.
+- `fut --remote workbox` runs the interface, theme, input handling, and
+  clipboard locally while the daemon and PTYs remain on `workbox`.
+
 Run Fut's interface locally while its daemon and terminals remain on an SSH
 host:
 
@@ -97,6 +104,11 @@ endpoint fails without restarting either daemon or retrying the private local
 protocol. The local exact-version check and `--ignore-protocol-mismatch` escape
 hatch are unchanged. See the [remote protocol contract](remote-protocol.md).
 
+Remote Fut currently requires macOS or Linux on both ends. Windows clients and
+Windows remote daemons are unsupported because the bridge connects to Fut's
+private Unix socket. Fut opens outbound OpenSSH processes only: no Fut daemon
+listens on TCP and there is no central Fut server.
+
 ### Saved machines
 
 Keep a catalog of the SSH machines you attach to:
@@ -124,18 +136,32 @@ targets that embed a password or use URI syntax are rejected. The catalog is
 the private file `$XDG_STATE_HOME/fut/machines.toml`
 (`~/.local/state/fut/machines.toml` by default). Disabling or removing a
 profile only affects the catalog: the remote daemon and its panes keep running.
-Attaching by saved label is not available yet; pass the SSH target to
-`fut --remote`.
+Open the navigator (`Ctrl-b s`) in a local client to browse Local and every
+saved machine together. Fut adds the machine level only when a saved profile
+exists, so the one-machine hierarchy and keybindings remain unchanged. Online
+resources can be selected directly; Fut freezes input while it prepares the
+new attachment, validates a fresh whole-tab view, applies geometry, and then
+atomically changes ownership. Tabs never combine panes from different machines.
+Agent search and notifications include machine labels when federation is
+configured. Cached resources from reconnecting or disabled machines remain
+visible as stale summaries but cannot be selected, acknowledged, resized, or
+sent commands.
 
 While a local Fut interface is open, it independently watches Local and every
 enabled saved machine for resource, presence, agent, alert, and extension
 metadata. These background connections never request terminal screens or start,
 stop, or upgrade a daemon. Background SSH is non-interactive and requires an
-already trusted host key and non-prompting authentication. Transient disconnects
+already trusted host key and non-prompting authentication (normally an
+`ssh-agent`, hardware agent, or an OpenSSH configuration that needs no prompt).
+Connect with ordinary `ssh` first to review a new host key; Fut never accepts or
+repairs host keys and stores no credentials. Transient disconnects
 retain clearly stale metadata and retry with a capped delay; host-key,
 authentication, installation, and protocol problems wait for interactive repair.
 Changes made with `fut machine enable`, `disable`, `rename`, or `remove` are
 picked up by an open interface without changing its active machine.
+The catalog accepts at most 256 profiles. Retry delays grow from one to at most
+30 seconds independently per endpoint, so one failed machine neither blocks
+another machine nor steals focus when it reconnects.
 
 For Git repositories, Fut groups linked worktrees from the same repository as
 peer workspaces in one session. Ordinary directories get their own session.

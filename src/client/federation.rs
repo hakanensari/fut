@@ -58,6 +58,13 @@ impl EndpointSpec {
         }
     }
 
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Local => "Local",
+            Self::Ssh(machine) => &machine.label,
+        }
+    }
+
     fn enabled(&self) -> bool {
         match self {
             Self::Local => true,
@@ -272,13 +279,6 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "machine-qualified presentation consumes freshness in the next roadmap step"
-        )
-    )]
     pub(crate) fn is_current<T>(&self, snapshot: &Snapshot<T>) -> bool {
         self.status == Status::Ready && snapshot.generation == self.generation
     }
@@ -456,6 +456,42 @@ pub(crate) struct State {
     pub(crate) catalog_error: Option<String>,
 }
 
+#[cfg(test)]
+impl State {
+    pub(crate) fn fixture(
+        endpoints: Vec<(EndpointSpec, Status, Generation, Option<ResourceSnapshot>)>,
+    ) -> Self {
+        let endpoints = endpoints
+            .into_iter()
+            .map(|(spec, status, generation, resources)| {
+                let id = spec.id();
+                (
+                    id,
+                    Endpoint {
+                        spec,
+                        generation,
+                        status,
+                        negotiation: None,
+                        metadata: Metadata {
+                            resources: resources.map(|value| Snapshot { generation, value }),
+                            ..Metadata::default()
+                        },
+                        failure: None,
+                        accepting_events: status == Status::Ready,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            registry: Registry {
+                endpoints,
+                active: MachineId::Local,
+            },
+            catalog_error: None,
+        }
+    }
+}
+
 /// Owns the continuously driven supervisor while today's single-endpoint UI is
 /// running. The watch snapshot is the handoff to machine-qualified presentation.
 pub(crate) struct Service {
@@ -545,6 +581,10 @@ impl Service {
         self.state.borrow().clone()
     }
 
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<State>> {
+        self.state.clone()
+    }
+
     pub(crate) async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -558,6 +598,10 @@ impl Drop for Service {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+        // Error paths cannot await, but they must synchronously drop every
+        // transport owner instead of leaving background SSH alive until the
+        // surrounding runtime happens to stop.
+        self.task.abort();
     }
 }
 
@@ -1200,6 +1244,72 @@ mod tests {
         supervisor.shutdown().await;
         assert_eq!(local.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(remote.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn two_remote_endpoints_fail_reconnect_and_cleanup_independently() {
+        let alpha = machine(11);
+        let beta = machine(12);
+        let alpha_id = MachineId::Ssh(alpha.id);
+        let beta_id = MachineId::Ssh(beta.id);
+        let (mut supervisor, mut attempts, mut timers) = setup(&[alpha, beta]);
+        let mut started = BTreeMap::new();
+        for _ in 0..3 {
+            let attempt = guard(attempts.recv()).await.unwrap();
+            started.insert(attempt.spec.id(), attempt);
+        }
+        let local = ready(
+            &mut supervisor,
+            started.remove(&MachineId::Local).unwrap(),
+            1,
+        )
+        .await;
+        let alpha_live = ready(&mut supervisor, started.remove(&alpha_id).unwrap(), 10).await;
+        let beta_live = ready(&mut supervisor, started.remove(&beta_id).unwrap(), 20).await;
+
+        alpha_live
+            .updates
+            .send(Err(Failure::transient("alpha offline")))
+            .unwrap();
+        status(&mut supervisor, alpha_id, Status::Reconnecting).await;
+        assert_eq!(
+            supervisor.registry().get(beta_id).unwrap().status,
+            Status::Ready
+        );
+        assert_eq!(
+            supervisor
+                .registry()
+                .get(beta_id)
+                .unwrap()
+                .metadata
+                .resources
+                .as_ref()
+                .unwrap()
+                .value
+                .revision,
+            20
+        );
+        timers.fire(Duration::from_secs(1)).await;
+        let retry = guard(attempts.recv()).await.unwrap();
+        assert_eq!(retry.spec.id(), alpha_id);
+        let alpha_reconnected = ready(&mut supervisor, retry, 2).await;
+        assert!(
+            supervisor
+                .registry()
+                .get(alpha_id)
+                .unwrap()
+                .metadata
+                .resources
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.value.revision == 2)
+        );
+        assert_eq!(supervisor.registry().active(), MachineId::Local);
+
+        supervisor.shutdown().await;
+        assert_eq!(local.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(alpha_live.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(alpha_reconnected.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(beta_live.dropped.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

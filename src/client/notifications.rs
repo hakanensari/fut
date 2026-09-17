@@ -15,6 +15,8 @@ use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title, row_style,
 };
+use super::federation::{Generation, MachineId, State as FederationState};
+use super::navigator::NavigatorSelection;
 
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 16;
@@ -57,7 +59,7 @@ impl ActivityIndicator {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct NotificationState {
     alerts: ClientAlertSnapshot,
 }
@@ -190,6 +192,10 @@ impl NotificationState {
                         }
                         let mut push = |kind, occurred_at_ms, acknowledgement| {
                             waiting.push(WaitingTerminal {
+                                machine: MachineId::Local,
+                                generation: Generation::default(),
+                                machine_label: None,
+                                selectable: true,
                                 session_id: session.id,
                                 pane_id: pane.id,
                                 terminal_id: pane.terminal_id,
@@ -296,6 +302,10 @@ impl NotificationState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WaitingTerminal {
+    pub machine: MachineId,
+    pub generation: Generation,
+    pub machine_label: Option<String>,
+    pub selectable: bool,
     pub session_id: SessionId,
     pub pane_id: PaneId,
     pub terminal_id: TerminalId,
@@ -347,8 +357,8 @@ pub(super) struct NotificationsDialog {
 pub(super) enum NotificationsAction {
     Stay,
     Close,
-    Select(PaneId),
-    Acknowledge(AttentionAcknowledgement),
+    Select(NavigatorSelection),
+    Acknowledge(MachineId, Generation, AttentionAcknowledgement),
 }
 
 impl NotificationsDialog {
@@ -378,6 +388,58 @@ impl NotificationsDialog {
         self.scroll = self.scroll.min(self.selected);
     }
 
+    pub(super) fn accept_federation(
+        &mut self,
+        state: &FederationState,
+        active: MachineId,
+        active_notifications: &NotificationState,
+    ) {
+        if state.registry.iter().count() <= 1 {
+            return;
+        }
+        let selected = self
+            .rows
+            .get(self.selected)
+            .map(|row| (row.machine, row.terminal_id));
+        let mut rows = Vec::new();
+        for (machine, endpoint) in state.registry.iter() {
+            let Some(resources) = endpoint.metadata.resources.as_ref() else {
+                continue;
+            };
+            let current = endpoint.is_current(resources);
+            let mut notifications = NotificationState::default();
+            if machine == active {
+                notifications = active_notifications.clone();
+            } else if let Some(alerts) = endpoint.metadata.alerts.as_ref() {
+                notifications.accept_alerts(alerts.value.clone());
+            }
+            let label = endpoint.spec.label();
+            let mut waiting = notifications.waiting(&resources.value);
+            for row in &mut waiting {
+                row.machine = machine;
+                row.generation = endpoint.generation;
+                row.machine_label = Some(if current {
+                    label.to_owned()
+                } else {
+                    format!("{label} · stale")
+                });
+                row.selectable = current;
+            }
+            rows.extend(waiting);
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row.occurred_at_ms));
+        self.rows = rows;
+        self.selected = selected
+            .and_then(|selected| {
+                self.rows
+                    .iter()
+                    .position(|row| (row.machine, row.terminal_id) == selected)
+            })
+            .unwrap_or(0)
+            .min(self.rows.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.selected);
+    }
+
     pub(super) fn key(&mut self, key: KeyEvent, visible_rows: usize) -> NotificationsAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return NotificationsAction::Stay;
@@ -388,16 +450,26 @@ impl NotificationsDialog {
                 return self
                     .rows
                     .get(self.selected)
+                    .filter(|row| row.selectable)
                     .map_or(NotificationsAction::Stay, |row| {
-                        NotificationsAction::Select(row.pane_id)
+                        NotificationsAction::Select(NavigatorSelection {
+                            machine: row.machine,
+                            generation: row.generation,
+                            selector: crate::resources::TargetSelector::Pane(row.pane_id),
+                        })
                     });
             }
             KeyCode::Char('c') => {
                 return self
                     .rows
                     .get(self.selected)
+                    .filter(|row| row.selectable)
                     .map_or(NotificationsAction::Stay, |row| {
-                        NotificationsAction::Acknowledge(row.acknowledgement)
+                        NotificationsAction::Acknowledge(
+                            row.machine,
+                            row.generation,
+                            row.acknowledgement,
+                        )
                     });
             }
             KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
@@ -460,8 +532,13 @@ impl NotificationsDialog {
                 };
                 let age = age(row.occurred_at_ms);
                 let text = format!(
-                    " {marker} {kind}  {} › {} › {}  {age}",
-                    row.session, row.workspace, row.tab
+                    " {marker} {kind}  {} › {} › {}{}  {age}",
+                    row.session,
+                    row.workspace,
+                    row.tab,
+                    row.machine_label
+                        .as_deref()
+                        .map_or_else(String::new, |machine| format!(" · {machine}")),
                 );
                 let text = truncate(&text, usize::from(area.width));
                 let y = area.y + header + line as u16;
@@ -831,7 +908,7 @@ mod tests {
 
         assert!(matches!(
             dialog.key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE), 10),
-            NotificationsAction::Acknowledge(AttentionAcknowledgement::Agent {
+            NotificationsAction::Acknowledge(_, _, AttentionAcknowledgement::Agent {
                 terminal_id,
                 event_revision: 1,
             }) if terminal_id == pane.terminal_id

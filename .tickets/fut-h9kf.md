@@ -1,6 +1,6 @@
 ---
 id: fut-h9kf
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-09-15T13:21:56Z

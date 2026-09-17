@@ -3324,6 +3324,10 @@ mod tests {
     #[test]
     fn current_agent_styles_only_its_source_and_keeps_status_color() {
         let item = AgentItem {
+            machine: crate::client::federation::MachineId::Local,
+            generation: crate::client::federation::Generation::default(),
+            machine_label: None,
+            selectable: true,
             terminal_id: TerminalId::new(),
             pane_id: PaneId::new(),
             session: "session".into(),

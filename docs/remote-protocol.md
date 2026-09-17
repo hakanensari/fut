@@ -100,6 +100,12 @@ authentication, installation, and compatibility failures require interactive
 repair. Health uses correlated `ping`/`pong`, or correlated `list_resources` as
 the fallback when `health.v1` is absent.
 
+Use `fut doctor` to validate OpenSSH, the private saved-profile catalog, and a
+bounded non-interactive compatibility handshake for enabled profiles. Doctor
+does not repair hosts or mutate either endpoint. Operational setup and the
+difference between `ssh -t host fut` and `fut --remote host` are documented in
+[Using Fut](usage.md#attach-to-a-remote-machine).
+
 ## Frozen semantics and evolution
 
 Generation 1 deliberately reuses `Envelope`, `ClientMode`, `SelectedView`,

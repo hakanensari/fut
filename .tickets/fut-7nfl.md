@@ -1,6 +1,6 @@
 ---
 id: fut-7nfl
-status: open
+status: closed
 deps: [fut-zyz5]
 links: []
 created: 2026-09-15T13:21:57Z

@@ -5,6 +5,8 @@
 - Added configurable direct hotkeys for running actions without the command prefix.
 - Remote attachments now work across compatible Fut versions and adapt to the remote daemon's supported features.
 - Local interfaces now supervise enabled saved machines independently in the background, retaining stale metadata across transient reconnects without streaming terminal screens.
+- Local interfaces now browse machine-qualified resources, agents, and notifications together and switch whole interactive tabs atomically without sending input to stale or inactive machines.
+- `fut doctor` now validates OpenSSH, saved machine profiles, and enabled remote endpoint compatibility without modifying hosts.
 - Added `fut --remote HOST` for using the local interface and clipboard with an existing Fut daemon over SSH.
 - Added `fut machine add/list/show/rename/enable/disable/remove` for a private catalog of saved SSH machines; `machine add` confirms the remote daemon over SSH before saving, and the other commands never contact it.
 - Added `fut attach --ignore-protocol-mismatch` as an explicit escape hatch for accessing older daemons.

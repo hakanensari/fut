@@ -1,6 +1,6 @@
 ---
 id: fut-hpia
-status: open
+status: closed
 deps: [fut-7nfl]
 links: []
 created: 2026-09-15T13:21:57Z

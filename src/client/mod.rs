@@ -16,6 +16,7 @@ mod federation;
 mod federation_transport;
 mod fuzzy;
 mod graphics;
+mod handoff;
 mod hotkey;
 pub(crate) mod input;
 mod layout;
@@ -467,7 +468,8 @@ pub async fn attach_navigator(
         alerts,
         ui,
         catalog.generation,
-        Attachment::Local(socket_path),
+        Attachment::Local(socket_path.to_owned()),
+        Some(&federation),
         config_location,
         guard.enhanced_keyboard,
     )
@@ -556,6 +558,7 @@ async fn attach_remote_inner(
             ui,
             generation,
             Attachment::Remote(remote.capabilities),
+            None,
             config_location,
             guard.enhanced_keyboard,
         )
@@ -600,6 +603,26 @@ pub async fn probe_remote(host: &str) -> anyhow::Result<String> {
     })
     .await
     .map_err(remote::report_error)
+}
+
+/// Read-only, non-interactive compatibility probe used by doctor. It uses the
+/// same strict background SSH policy as federation and always reaps its child.
+pub(crate) async fn diagnose_remote(host: &str) -> anyhow::Result<String> {
+    let (stream, bridge) = crate::ssh_bridge::SshBridge::connect_background(host)?;
+    let result = prepare_remote(async {
+        let remote = remote::negotiate(
+            stream,
+            ClientMode::Control,
+            env!("CARGO_PKG_VERSION"),
+            Duration::from_secs(5),
+        )
+        .await
+        .context(REMOTE_HANDSHAKE_FAILED)?;
+        Ok(remote.welcome.server_version)
+    })
+    .await;
+    let cleanup = bridge.shutdown().await;
+    result.and_then(|version| cleanup.map(|()| version))
 }
 
 /// Runs `work` over one fresh SSH bridge, then terminates and reaps SSH
@@ -668,7 +691,8 @@ pub(crate) async fn attach_with_ui(
         alerts,
         ui,
         catalog.generation,
-        Attachment::Local(socket_path),
+        Attachment::Local(socket_path.to_owned()),
+        Some(&federation),
         config_location,
         guard.enhanced_keyboard,
     )
@@ -821,6 +845,189 @@ async fn handshake_interactive(
     ))
 }
 
+struct PreparedMachineAttachment {
+    framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    selected: SelectedView,
+    alerts: crate::alerts::ClientAlertSnapshot,
+    ui: UiConfig,
+    catalog_generation: u64,
+    attachment: Attachment,
+    bridge: Option<crate::ssh_bridge::SshBridge>,
+}
+
+impl PreparedMachineAttachment {
+    async fn discard(&mut self) {
+        if let Some(bridge) = self.bridge.take() {
+            let _ = bridge.shutdown().await;
+        }
+    }
+}
+
+fn endpoint_matches(
+    state: &federation::State,
+    key: handoff::AttachmentKey,
+    spec: &federation::EndpointSpec,
+) -> bool {
+    state.registry.get(key.machine).is_some_and(|endpoint| {
+        endpoint.status == federation::Status::Ready
+            && endpoint.generation == key.generation
+            && endpoint.spec == *spec
+    })
+}
+
+async fn prepare_machine_attachment(
+    spec: federation::EndpointSpec,
+    selector: TargetSelector,
+    size: TerminalSize,
+    local_socket: &Path,
+    config_location: &config::ConfigLocation,
+) -> anyhow::Result<PreparedMachineAttachment> {
+    let staged = stage_ui_config(config_location)?;
+    match spec {
+        federation::EndpointSpec::Local => {
+            let alert_client_id = alert_client_id(local_socket)?;
+            let (framed, selected, catalog, alerts) = connect_interactive(
+                local_socket,
+                Some(selector),
+                size,
+                alert_client_id,
+                PROTOCOL_VERSION,
+            )
+            .await?;
+            let ui = staged.materialize(&catalog)?;
+            Ok(PreparedMachineAttachment {
+                framed,
+                selected,
+                alerts,
+                ui,
+                catalog_generation: catalog.generation,
+                attachment: Attachment::Local(local_socket.to_owned()),
+                bridge: None,
+            })
+        }
+        federation::EndpointSpec::Ssh(machine) => {
+            // This runs in raw mode, so handoffs use non-interactive SSH and
+            // never let host-key or authentication prompts consume UI input.
+            let (stream, bridge) =
+                crate::ssh_bridge::SshBridge::connect_background(&machine.target)?;
+            let result = async {
+                let remote = remote::interactive(stream, selector, size, Duration::from_secs(15))
+                    .await
+                    .context(REMOTE_HANDSHAKE_FAILED)?;
+                let ui =
+                    remote::materialize_ui(&staged, remote.welcome.extension_catalog.as_ref())?;
+                let catalog_generation = remote
+                    .welcome
+                    .extension_catalog
+                    .as_ref()
+                    .map_or(0, |catalog| catalog.generation);
+                Ok::<_, anyhow::Error>((remote, ui, catalog_generation))
+            }
+            .await;
+            match result {
+                Ok((remote, ui, catalog_generation)) => Ok(PreparedMachineAttachment {
+                    framed: remote.framed,
+                    selected: remote
+                        .welcome
+                        .selected
+                        .expect("validated interactive welcome"),
+                    alerts: crate::alerts::ClientAlertSnapshot::default(),
+                    ui,
+                    catalog_generation,
+                    attachment: Attachment::Remote(remote.capabilities),
+                    bridge: Some(bridge),
+                }),
+                Err(error) => {
+                    bridge
+                        .shutdown()
+                        .await
+                        .context("clean up failed SSH handoff")?;
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+async fn stage_machine_view(
+    prepared: &mut PreparedMachineAttachment,
+    view: &mut ViewState,
+    host: Rect,
+) -> anyhow::Result<ResourceState> {
+    send_request(
+        &mut prepared.framed,
+        Some(Uuid::new_v4()),
+        ClientMessage::ListResources,
+    )
+    .await?;
+    time::timeout(Duration::from_secs(10), async {
+        let mut resources = ResourceState::default();
+        resources.accept_alerts(prepared.alerts.clone());
+        let mut geometry_applied = false;
+        loop {
+            let frame = prepared.framed.next().await.ok_or_else(|| {
+                anyhow::anyhow!("target disconnected before its view was ready")
+            })??;
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+            if let Attachment::Remote(capabilities) = &prepared.attachment
+                && !capabilities.allows_server(&envelope.message)
+            {
+                return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
+            }
+            match envelope.message {
+                ServerMessage::Snapshot {
+                    terminal_id,
+                    screen,
+                } => {
+                    view.accept(terminal_id, screen);
+                }
+                ServerMessage::Resources { snapshot, presence } => {
+                    resources.accept_presence(presence);
+                    resources.accept(snapshot);
+                }
+                ServerMessage::ResourcesChanged { snapshot } => {
+                    resources.accept(snapshot);
+                }
+                ServerMessage::PresenceChanged { presence } => {
+                    resources.accept_presence(presence);
+                }
+                ServerMessage::AlertsChanged { snapshot } => {
+                    resources.accept_alerts(snapshot);
+                }
+                ServerMessage::TerminalResized { terminal_id, size } => {
+                    if let Some(request_id) = envelope.request_id {
+                        view.complete_resize(Some(request_id), terminal_id, size);
+                    }
+                }
+                ServerMessage::Error { code, message } => {
+                    bail!("target daemon error ({code}): {message}")
+                }
+                ServerMessage::EndpointError { error } => return Err(error.into()),
+                ServerMessage::Detached => bail!("target detached before its view was ready"),
+                _ => {}
+            }
+            let metadata_ready = resources
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.revision >= view.selected_revision);
+            if !geometry_applied && view.all_screens_ready() && metadata_ready {
+                resize_view(&mut prepared.framed, host, view, &resources, &prepared.ui).await?;
+                view.discard_screens_awaiting_resize();
+                geometry_applied = true;
+            }
+            if geometry_applied
+                && view.geometry_ready()
+                && resources
+                    .snapshot()
+                    .is_some_and(|snapshot| snapshot.revision >= view.selected_revision)
+            {
+                return Ok(resources);
+            }
+        }
+    })
+    .await
+    .context("target view readiness timed out")?
+}
+
 async fn connect_control_navigator(
     socket_path: &Path,
     ignore_protocol_mismatch: bool,
@@ -959,7 +1166,7 @@ async fn initial_navigator(
                     match navigator.key(key, visible) {
                         NavigatorAction::Stay => {}
                         NavigatorAction::Close => return Ok(None),
-                        NavigatorAction::Select(selector) => return Ok(Some(selector)),
+                        NavigatorAction::Select(selection) => return Ok(Some(selection.selector)),
                     }
                 }
                 Some(Event::Paste(text)) => navigator.paste(&text),
@@ -1021,7 +1228,8 @@ async fn run(
     alerts: crate::alerts::ClientAlertSnapshot,
     ui: UiConfig,
     catalog_generation: u64,
-    attachment: Attachment<'_>,
+    attachment: Attachment,
+    federation: Option<&federation::Service>,
     config_location: &config::ConfigLocation,
     enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
@@ -1034,6 +1242,7 @@ async fn run(
         ui,
         catalog_generation,
         attachment,
+        federation,
         config_location,
         &mut client_hooks,
         enhanced_keyboard,
@@ -1056,12 +1265,33 @@ async fn run_loop(
     alerts: crate::alerts::ClientAlertSnapshot,
     mut ui: UiConfig,
     mut extension_generation: u64,
-    attachment: Attachment<'_>,
+    mut attachment: Attachment,
+    federation: Option<&federation::Service>,
     config_location: &config::ConfigLocation,
     client_hooks: &mut Option<crate::extensions::ClientHookRuntime>,
     enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
+    let mut federation_updates = federation.map(federation::Service::subscribe);
+    let mut active_machine = federation::MachineId::Local;
+    let initial_generation = federation
+        .and_then(|service| {
+            service
+                .snapshot()
+                .registry
+                .get(active_machine)
+                .map(|endpoint| endpoint.generation)
+        })
+        .unwrap_or(federation::Generation {
+            supervisor: 1,
+            connection: 1,
+        });
+    let mut handoff = handoff::Coordinator::new(handoff::AttachmentKey {
+        machine: active_machine,
+        generation: initial_generation,
+    });
+    let local_socket = attachment.local_socket().ok().map(Path::to_owned);
+    let mut active_bridge: Option<crate::ssh_bridge::SshBridge> = None;
     let mut termination = TerminationSignals::subscribe()?;
     let mut prefix = PrefixState::new(ui.bindings.clone());
     let mut prefix_keys_awaiting_release = HashSet::new();
@@ -1102,6 +1332,51 @@ async fn run_loop(
 
     loop {
         tokio::select! {
+            changed = async {
+                federation_updates
+                    .as_mut()
+                    .expect("guarded federation receiver")
+                    .changed()
+                    .await
+            }, if federation_updates.is_some() => {
+                if changed.is_err() {
+                    federation_updates = None;
+                    continue;
+                }
+                let state = federation_updates
+                    .as_ref()
+                    .expect("changed receiver remains available")
+                    .borrow()
+                    .clone();
+                match surface.as_mut() {
+                    Some(ClientSurface::Navigator(navigator)) => {
+                        navigator.accept_federation(
+                            &state,
+                            active_machine,
+                            view.focused(),
+                            &workspace_history,
+                            resources.notifications(),
+                        );
+                    }
+                    Some(ClientSurface::Agents(dialog)) => {
+                        dialog.accept_federation(
+                            &state,
+                            active_machine,
+                            view.focused(),
+                            resources.notifications(),
+                        );
+                    }
+                    Some(ClientSurface::Notifications(dialog)) => {
+                        dialog.accept_federation(
+                            &state,
+                            active_machine,
+                            resources.notifications(),
+                        );
+                    }
+                    _ => {}
+                }
+                force_draw = true;
+            }
             name = termination.recv() => {
                 // Returning unwinds through TerminalGuard, restoring the host
                 // terminal (mouse tracking off, cooked mode) before exit.
@@ -1252,7 +1527,7 @@ async fn run_loop(
                 if let Some(perf) = perf.as_mut() {
                     perf.record("decode", decode_started.elapsed(), frame.len());
                 }
-                if let Attachment::Remote(capabilities) = attachment
+                if let Attachment::Remote(capabilities) = &attachment
                     && !capabilities.allows_server(&envelope.message)
                 {
                     return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
@@ -2384,7 +2659,15 @@ async fn run_loop(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            NotificationsAction::Select(pane_id) => {
+                            NotificationsAction::Select(selection) => {
+                                if selection.machine != active_machine {
+                                    toasts.info("select this machine in the navigator to open its notification");
+                                    force_draw = true;
+                                    continue;
+                                }
+                                let TargetSelector::Pane(pane_id) = selection.selector else {
+                                    unreachable!("notifications always select panes")
+                                };
                                 release_captured_mouse_input(
                                     framed,
                                     &mut mouse_input,
@@ -2404,7 +2687,25 @@ async fn run_loop(
                                 }
                                 force_draw = true;
                             }
-                            NotificationsAction::Acknowledge(acknowledgement) => {
+                            NotificationsAction::Acknowledge(machine, generation, acknowledgement) => {
+                                let current = if machine == active_machine
+                                    && generation == federation::Generation::default()
+                                {
+                                    true
+                                } else {
+                                    federation
+                                        .map(federation::Service::snapshot)
+                                        .and_then(|state| state.registry.get(machine).map(|endpoint| {
+                                            endpoint.status == federation::Status::Ready
+                                                && endpoint.generation == generation
+                                        }))
+                                        .unwrap_or(machine == active_machine)
+                                };
+                                if machine != active_machine || !current {
+                                    toasts.error("notification belongs to a stale or inactive machine");
+                                    force_draw = true;
+                                    continue;
+                                }
                                 acknowledge_attention(framed, acknowledgement).await?;
                                 force_draw = true;
                             }
@@ -2449,7 +2750,181 @@ async fn run_loop(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            NavigatorAction::Select(selector) => {
+                            NavigatorAction::Select(selection) => {
+                                if selection.machine != active_machine {
+                                    let target_key = handoff::AttachmentKey {
+                                        machine: selection.machine,
+                                        generation: selection.generation,
+                                    };
+                                    if !handoff.begin(target_key) {
+                                        toasts.error("another machine handoff is already active");
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                    release_captured_mouse_input(
+                                        framed,
+                                        &mut mouse_input,
+                                        view.focused().terminal_id,
+                                    ).await?;
+                                    let Some(service) = federation else {
+                                        handoff.fail();
+                                        toasts.error("machine handoff is unavailable");
+                                        force_draw = true;
+                                        continue;
+                                    };
+                                    let Some(local_socket) = local_socket.as_deref() else {
+                                        handoff.fail();
+                                        toasts.error("machine handoff requires a local Fut socket");
+                                        force_draw = true;
+                                        continue;
+                                    };
+                                    let before = service.snapshot();
+                                    let Some(endpoint) = before.registry.get(selection.machine)
+                                        .filter(|endpoint| endpoint.status == federation::Status::Ready)
+                                        .filter(|endpoint| endpoint.generation == selection.generation)
+                                    else {
+                                        handoff.fail();
+                                        toasts.error("machine is no longer online");
+                                        force_draw = true;
+                                        continue;
+                                    };
+                                    let spec = endpoint.spec.clone();
+                                    let host_size = terminal.size()?;
+                                    let size = TerminalSize {
+                                        columns: host_size.width,
+                                        rows: host_size.height,
+                                    };
+                                    let prepared = prepare_machine_attachment(
+                                        spec.clone(),
+                                        selection.selector,
+                                        size,
+                                        local_socket,
+                                        config_location,
+                                    ).await;
+                                    let mut prepared = match prepared {
+                                        Ok(prepared) => prepared,
+                                        Err(error) => {
+                                            handoff.fail();
+                                            toasts.error(format!(
+                                                "machine handoff failed · {}",
+                                                one_line_error(&error)
+                                            ));
+                                            force_draw = true;
+                                            continue;
+                                        }
+                                    };
+                                    debug_assert!(handoff.advance(
+                                        handoff::Phase::Connecting,
+                                        handoff::Phase::ValidatingView,
+                                    ));
+                                    if !endpoint_matches(&service.snapshot(), target_key, &spec) {
+                                        handoff.fail();
+                                        prepared.discard().await;
+                                        toasts.error("machine changed while the handoff was preparing");
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                    let next_view = match ViewState::new(
+                                        prepared.attachment.locality(),
+                                        prepared.selected.clone(),
+                                    ) {
+                                        Ok(view) => view,
+                                        Err(error) => {
+                                            handoff.fail();
+                                            prepared.discard().await;
+                                            toasts.error(format!(
+                                                "machine handoff rejected · {}",
+                                                one_line_error(&error)
+                                            ));
+                                            force_draw = true;
+                                            continue;
+                                        }
+                                    };
+                                    let mut next_view = next_view;
+                                    let next_resources = match stage_machine_view(
+                                        &mut prepared,
+                                        &mut next_view,
+                                        terminal.size()?.into(),
+                                    ).await {
+                                        Ok(resources) => resources,
+                                        Err(error) => {
+                                            handoff.fail();
+                                            prepared.discard().await;
+                                            toasts.error(format!(
+                                                "machine handoff failed before its view was ready · {}",
+                                                one_line_error(&error)
+                                            ));
+                                            force_draw = true;
+                                            continue;
+                                        }
+                                    };
+                                    debug_assert!(handoff.advance(
+                                        handoff::Phase::ValidatingView,
+                                        handoff::Phase::ApplyingGeometry,
+                                    ));
+                                    // The interactive handshake applies the current host geometry
+                                    // before returning its SelectedView.
+                                    debug_assert!(handoff.advance(
+                                        handoff::Phase::ApplyingGeometry,
+                                        handoff::Phase::Revalidating,
+                                    ));
+                                    if !endpoint_matches(&service.snapshot(), target_key, &spec) {
+                                        handoff.fail();
+                                        prepared.discard().await;
+                                        toasts.error("machine changed before handoff commit");
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                    if !handoff.commit(target_key) {
+                                        prepared.discard().await;
+                                        toasts.error("machine reconnected before handoff commit");
+                                        force_draw = true;
+                                        continue;
+                                    }
+
+                                    // Commit is one synchronous ownership swap. Until here every
+                                    // send used the source connection; afterwards every send uses
+                                    // the candidate. No candidate transport is exposed to input.
+                                    std::mem::swap(framed, &mut prepared.framed);
+                                    let old_bridge = active_bridge.take();
+                                    active_bridge = prepared.bridge.take();
+                                    attachment = prepared.attachment;
+                                    active_machine = selection.machine;
+                                    view = next_view;
+                                    resources = next_resources;
+                                    ui = prepared.ui;
+                                    extension_generation = prepared.catalog_generation;
+                                    surface = None;
+                                    temporary_command = None;
+                                    copy_mode = None;
+                                    rename = None;
+                                    workspace_history = NavigationHistory::default();
+                                    workspace_history.record(view.focused());
+                                    create = CreateCoordinator::default();
+                                    close_target = CloseTargetState::default();
+                                    focus = FocusState::default();
+                                    pending_focused_exit = None;
+                                    mouse_input.clear();
+                                    prefix = PrefixState::new(ui.bindings.clone());
+                                    prefix_keys_awaiting_release.clear();
+                                    extension_reload = None;
+                                    project_config_reload = None;
+                                    project_preparation = None;
+                                    kitty_graphics = graphics::Renderer::new();
+                                    if let Some(hooks) = client_hooks.take() {
+                                        hooks.shutdown().await;
+                                    }
+                                    *client_hooks = attachment.client_hooks(&ui)?;
+                                    let _ = send(&mut prepared.framed, ClientMessage::Detach).await;
+                                    drop(prepared.framed);
+                                    if let Some(bridge) = old_bridge {
+                                        let _ = bridge.shutdown().await;
+                                    }
+                                    debug_assert!(handoff.permits(target_key));
+                                    view.invalidate_drawn();
+                                    force_draw = true;
+                                    continue;
+                                }
                                 release_captured_mouse_input(
                                     framed,
                                     &mut mouse_input,
@@ -2464,7 +2939,7 @@ async fn run_loop(
                                     framed,
                                     Some(request),
                                     ClientMessage::SelectTarget {
-                                        selector,
+                                        selector: selection.selector,
                                         expected: None,
                                     },
                                 ).await?;
@@ -2487,7 +2962,15 @@ async fn run_loop(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            AgentsAction::Select(pane_id) => {
+                            AgentsAction::Select(selection) => {
+                                if selection.machine != active_machine {
+                                    toasts.info("select this machine in the navigator to switch agents");
+                                    force_draw = true;
+                                    continue;
+                                }
+                                let TargetSelector::Pane(pane_id) = selection.selector else {
+                                    unreachable!("agent rows always select panes")
+                                };
                                 release_captured_mouse_input(
                                     framed,
                                     &mut mouse_input,
@@ -2723,6 +3206,7 @@ async fn run_loop(
                                 ).await?;
                                 surface = None;
                                 view.invalidate_drawn();
+                                let federation_state = federation.map(federation::Service::snapshot);
                                 let toast = dispatch_client_action(
                                     action,
                                     framed,
@@ -2738,7 +3222,9 @@ async fn run_loop(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                    attachment,
+                                    &attachment,
+                                    federation_state.as_deref(),
+                                    active_machine,
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
@@ -3001,7 +3487,7 @@ async fn run_loop(
                                             host,
                                             &ui,
                                             &mut temporary_command,
-                                            attachment,
+                                            &attachment,
                                             &background_results,
                                         )
                                         .await?,
@@ -3299,6 +3785,7 @@ async fn run_loop(
                                         terminal_id: view.focused().terminal_id,
                                     },
                                 ).await?;
+                                let federation_state = federation.map(federation::Service::snapshot);
                                 let toast = dispatch_client_action(
                                     action,
                                     framed,
@@ -3314,7 +3801,9 @@ async fn run_loop(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                    attachment,
+                                    &attachment,
+                                    federation_state.as_deref(),
+                                    active_machine,
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
@@ -3669,6 +4158,9 @@ async fn run_loop(
                 }
             }
         }
+    }
+    if let Some(bridge) = active_bridge {
+        bridge.shutdown().await?;
     }
     Ok(())
 }
@@ -4695,7 +5187,7 @@ async fn dispatch_presentation_token_action(
     host: Rect,
     ui: &UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
-    attachment: Attachment<'_>,
+    attachment: &Attachment,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
 ) -> anyhow::Result<Option<Toast>> {
     let Some(snapshot) = resources.snapshot() else {
@@ -4851,7 +5343,9 @@ async fn dispatch_client_action(
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
-    attachment: Attachment<'_>,
+    attachment: &Attachment,
+    federation_state: Option<&federation::State>,
+    active_machine: federation::MachineId,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
     config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
@@ -5057,17 +5551,32 @@ async fn dispatch_client_action(
                 );
             }
             navigator.accept_presence(resources.presence());
+            if let Some(state) = federation_state {
+                navigator.accept_federation(
+                    state,
+                    active_machine,
+                    view.focused(),
+                    workspace_history,
+                    resources.notifications(),
+                );
+            }
             *surface = Some(ClientSurface::Navigator(navigator));
         }
         ClientAction::OpenAgents => {
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some(Toast::error("agents are still loading")));
             };
-            *surface = Some(ClientSurface::Agents(AgentsDialog::open(
-                snapshot,
-                view.focused(),
-                resources.notifications(),
-            )));
+            let mut dialog =
+                AgentsDialog::open(snapshot, view.focused(), resources.notifications());
+            if let Some(state) = federation_state {
+                dialog.accept_federation(
+                    state,
+                    active_machine,
+                    view.focused(),
+                    resources.notifications(),
+                );
+            }
+            *surface = Some(ClientSurface::Agents(dialog));
         }
         ClientAction::OpenLeftSidebar | ClientAction::OpenRightSidebar => {
             let side = if action == ClientAction::OpenLeftSidebar {
@@ -5116,10 +5625,11 @@ async fn dispatch_client_action(
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some(Toast::error("notifications are still loading")));
             };
-            *surface = Some(ClientSurface::Notifications(NotificationsDialog::open(
-                snapshot,
-                resources.notifications(),
-            )));
+            let mut dialog = NotificationsDialog::open(snapshot, resources.notifications());
+            if let Some(state) = federation_state {
+                dialog.accept_federation(state, active_machine, resources.notifications());
+            }
+            *surface = Some(ClientSurface::Notifications(dialog));
         }
         ClientAction::FocusNextNotification => {
             let Some(snapshot) = resources.snapshot() else {
@@ -6149,6 +6659,22 @@ impl ViewState {
         };
         view.replace(selected)?;
         Ok(view)
+    }
+
+    fn all_screens_ready(&self) -> bool {
+        self.panes.iter().all(|pane| pane.pending.is_some())
+    }
+
+    fn discard_screens_awaiting_resize(&mut self) {
+        for pane in &mut self.panes {
+            if pane.resize_request_id.is_some() {
+                pane.pending = None;
+            }
+        }
+    }
+
+    fn geometry_ready(&self) -> bool {
+        self.resize_requests.is_empty() && self.all_screens_ready()
     }
 
     fn replace(&mut self, selected: SelectedView) -> anyhow::Result<bool> {

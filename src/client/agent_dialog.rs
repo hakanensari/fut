@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{domain::PaneId, protocol::SelectedTarget, resources::ResourceSnapshot};
+use crate::{protocol::SelectedTarget, resources::ResourceSnapshot};
 
 use super::{
     agents::{self, AgentItem},
@@ -11,7 +11,9 @@ use super::{
         dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
         render_title,
     },
+    federation::{MachineId, State as FederationState},
     fuzzy,
+    navigator::NavigatorSelection,
     notifications::NotificationState,
     presentation::{ItemState, apply_item_state},
 };
@@ -31,7 +33,7 @@ pub(super) struct AgentsDialog {
 pub(super) enum AgentsAction {
     Stay,
     Close,
-    Select(PaneId),
+    Select(NavigatorSelection),
 }
 
 impl AgentsDialog {
@@ -73,6 +75,65 @@ impl AgentsDialog {
         self.ensure_selected_match();
     }
 
+    pub(super) fn accept_federation(
+        &mut self,
+        state: &FederationState,
+        active: MachineId,
+        focused: &SelectedTarget,
+        active_notifications: &NotificationState,
+    ) {
+        if state.registry.iter().count() <= 1 {
+            return;
+        }
+        let selected = self
+            .rows
+            .get(self.selected)
+            .map(|row| (row.machine, row.terminal_id));
+        let mut rows = Vec::new();
+        for (machine, endpoint) in state.registry.iter() {
+            let Some(resources) = endpoint.metadata.resources.as_ref() else {
+                continue;
+            };
+            let current = endpoint.is_current(resources);
+            let mut notifications = NotificationState::default();
+            if machine == active {
+                notifications = active_notifications.clone();
+            } else if let Some(alerts) = endpoint.metadata.alerts.as_ref() {
+                notifications.accept_alerts(alerts.value.clone());
+            }
+            let label = endpoint.spec.label();
+            let mut items = agents::items(
+                &resources.value,
+                focused,
+                &notifications,
+                AgentScope::Global,
+            );
+            for item in &mut items {
+                item.machine = machine;
+                item.generation = endpoint.generation;
+                item.machine_label = Some(if current {
+                    label.to_owned()
+                } else {
+                    format!("{label} · stale")
+                });
+                item.selectable = current;
+                item.current &= machine == active;
+            }
+            rows.extend(items);
+        }
+        self.rows = rows;
+        self.refilter();
+        self.selected = selected
+            .and_then(|selected| {
+                self.rows
+                    .iter()
+                    .position(|row| (row.machine, row.terminal_id) == selected)
+            })
+            .or_else(|| self.rows.iter().position(|row| row.current))
+            .unwrap_or(0);
+        self.ensure_selected_match();
+    }
+
     pub(super) fn key(&mut self, key: KeyEvent, visible_rows: usize) -> AgentsAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return AgentsAction::Stay;
@@ -83,7 +144,14 @@ impl AgentsDialog {
                 return self
                     .rows
                     .get(self.selected)
-                    .map_or(AgentsAction::Stay, |row| AgentsAction::Select(row.pane_id));
+                    .filter(|row| row.selectable)
+                    .map_or(AgentsAction::Stay, |row| {
+                        AgentsAction::Select(NavigatorSelection {
+                            machine: row.machine,
+                            generation: row.generation,
+                            selector: crate::resources::TargetSelector::Pane(row.pane_id),
+                        })
+                    });
             }
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                 self.move_selection(-1)
@@ -278,12 +346,19 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
-    use crate::{client::notifications::ActivityIndicator, domain::TerminalId};
+    use crate::{
+        client::notifications::ActivityIndicator,
+        domain::{PaneId, TerminalId},
+    };
 
     #[test]
     fn selected_row_keeps_one_background_while_status_owns_only_its_foreground() {
         let mut dialog = AgentsDialog {
             rows: vec![AgentItem {
+                machine: MachineId::Local,
+                generation: super::super::federation::Generation::default(),
+                machine_label: None,
+                selectable: true,
                 terminal_id: TerminalId::new(),
                 pane_id: PaneId::new(),
                 session: "fut".into(),

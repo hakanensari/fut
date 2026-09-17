@@ -59,6 +59,10 @@ run = "cargo test --locked --lib --all-features"
 [tasks."test:e2e"]
 run = "cargo test --locked --test e2e --all-features"
 
+[tasks."test:remote-ssh"]
+description = "Opt-in smoke test against FUT_REAL_SSH_TARGET"
+run = "sh scripts/remote-smoke"
+
 [tasks."test:extension-conformance"]
 description = "Build and exercise the compiled extension reference through public Fut boundaries"
 run = "scripts/extension-conformance"

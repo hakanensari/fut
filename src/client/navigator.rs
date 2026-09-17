@@ -20,6 +20,7 @@ use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title,
 };
+use super::federation::{Generation, MachineId, State as FederationState, Status as MachineStatus};
 use super::fuzzy;
 use super::navigation::NavigationHistory;
 use super::notifications::{ActivityIndicator, NotificationState};
@@ -69,6 +70,10 @@ impl ResourceFilter {
 pub(super) struct NavigatorRow {
     pub key: ResourceKey,
     pub session_id: SessionId,
+    pub machine: MachineId,
+    pub generation: Generation,
+    pub machine_header: bool,
+    pub selectable: bool,
     pub depth: u16,
     pub label: String,
     pub inline_pane: Option<PaneId>,
@@ -112,7 +117,14 @@ pub(super) struct NavigatorState {
 pub(super) enum NavigatorAction {
     Stay,
     Close,
-    Select(TargetSelector),
+    Select(NavigatorSelection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct NavigatorSelection {
+    pub machine: MachineId,
+    pub generation: Generation,
+    pub selector: TargetSelector,
 }
 
 impl NavigatorState {
@@ -165,6 +177,113 @@ impl NavigatorState {
             &NavigationHistory::default(),
             &NotificationState::default(),
         )
+    }
+
+    /// Replace the navigator with one machine-qualified snapshot. Cached rows
+    /// remain visible while disconnected, but only generation-current Ready
+    /// endpoints retain destinations. The old single-machine shape is left
+    /// completely untouched when Local is the only configured endpoint.
+    pub fn accept_federation(
+        &mut self,
+        state: &FederationState,
+        active: MachineId,
+        current: &SelectedTarget,
+        history: &NavigationHistory,
+        active_notifications: &NotificationState,
+    ) -> bool {
+        if state.registry.iter().count() <= 1 {
+            return false;
+        }
+        let old_identity = self.rows.get(self.selected).map(row_identity);
+        let old_index = self.selected;
+        let mut rows = Vec::new();
+        let empty_history = NavigationHistory::default();
+        for (machine, endpoint) in state.registry.iter() {
+            let label = endpoint.spec.label();
+            let status = machine_status(endpoint.status, endpoint.failure.as_ref());
+            let current_resources = endpoint
+                .metadata
+                .resources
+                .as_ref()
+                .filter(|snapshot| endpoint.is_current(snapshot));
+            let resources = current_resources.or(endpoint.metadata.resources.as_ref());
+            let mut notifications = NotificationState::default();
+            if machine == active {
+                notifications = active_notifications.clone();
+            } else if let Some(alerts) = endpoint.metadata.alerts.as_ref() {
+                notifications.accept_alerts(alerts.value.clone());
+            }
+            let mut machine_rows = resources.map_or_else(Vec::new, |resources| {
+                flatten_optional(
+                    &resources.value,
+                    (machine == active).then_some(current),
+                    if machine == active {
+                        history
+                    } else {
+                        &empty_history
+                    },
+                    &notifications,
+                )
+            });
+            let destination =
+                current_resources.and_then(|_| machine_rows.iter().find_map(|row| row.destination));
+            let header_id = machine_uuid(machine)
+                .to_string()
+                .parse::<SessionId>()
+                .expect("UUID is a valid session ID");
+            rows.push(NavigatorRow {
+                key: ResourceKey::Session(header_id),
+                session_id: header_id,
+                machine,
+                generation: endpoint.generation,
+                machine_header: true,
+                selectable: destination.is_some(),
+                depth: 0,
+                label: format!("{label} · {status}"),
+                inline_pane: None,
+                search_path: format!("{label} › {status}"),
+                current: machine == active,
+                closing: false,
+                destination,
+                activity: machine_rows
+                    .iter()
+                    .filter_map(|row| row.activity)
+                    .max_by_key(|activity| activity_priority(*activity)),
+                open_elsewhere: false,
+            });
+            for row in &mut machine_rows {
+                row.machine = machine;
+                row.generation = endpoint.generation;
+                row.machine_header = false;
+                row.selectable = current_resources.is_some() && row.destination.is_some();
+                row.depth = row.depth.saturating_add(1);
+                row.search_path = format!("{label} › {}", row.search_path);
+                if current_resources.is_none() {
+                    row.destination = None;
+                }
+            }
+            rows.extend(machine_rows);
+        }
+        self.rows = rows;
+        self.current_session = None;
+        self.presence = ClientPresenceSnapshot::default();
+        self.filter = None;
+        self.resource_revision = None;
+        self.status = if self.rows.is_empty() {
+            NavigatorStatus::Empty
+        } else {
+            NavigatorStatus::Ready
+        };
+        self.refilter();
+        self.selected = old_identity
+            .and_then(|identity| {
+                self.rows
+                    .iter()
+                    .position(|row| row_identity(row) == identity)
+            })
+            .unwrap_or_else(|| old_index.min(self.rows.len().saturating_sub(1)));
+        self.ensure_selected_match();
+        true
     }
 
     fn accept_optional_resources(
@@ -300,9 +419,14 @@ impl NavigatorState {
             {
                 if let Some(row) = self.rows.get(self.selected)
                     && !row.closing
+                    && row.selectable
                     && let Some(pane) = row.destination
                 {
-                    return NavigatorAction::Select(TargetSelector::Pane(pane));
+                    return NavigatorAction::Select(NavigatorSelection {
+                        machine: row.machine,
+                        generation: row.generation,
+                        selector: TargetSelector::Pane(pane),
+                    });
                 }
             }
             (KeyCode::Backspace | KeyCode::Delete, _) => self.remove_last_grapheme(),
@@ -658,13 +782,19 @@ impl NavigatorState {
                         } else {
                             " "
                         };
-                        let mut style = styles.apply(row.key.style(), Style::default());
+                        let mut style = if row.machine_header {
+                            styles.apply(SemanticStyle::Muted, Style::default())
+                        } else {
+                            styles.apply(row.key.style(), Style::default())
+                        };
                         if row.closing
                             || (row.open_elsewhere && self.current_session != Some(row.session_id))
                         {
                             style = style.add_modifier(Modifier::DIM);
                         }
-                        if row.current && !matches!(row.key, ResourceKey::Pane(_)) {
+                        if row.current
+                            && (row.machine_header || !matches!(row.key, ResourceKey::Pane(_)))
+                        {
                             style = style.add_modifier(Modifier::BOLD);
                         }
                         if index == self.selected {
@@ -735,6 +865,39 @@ fn breadcrumb_label(label: &str) -> String {
     }
     clipped.push('…');
     clipped
+}
+
+fn machine_uuid(machine: MachineId) -> Uuid {
+    match machine {
+        MachineId::Local => Uuid::nil(),
+        MachineId::Ssh(id) => id,
+    }
+}
+
+fn activity_priority(activity: ActivityIndicator) -> u8 {
+    match activity {
+        ActivityIndicator::Bell => 4,
+        ActivityIndicator::Blocked => 3,
+        ActivityIndicator::Completed => 2,
+        ActivityIndicator::Working => 1,
+    }
+}
+
+fn row_identity(row: &NavigatorRow) -> (MachineId, bool, ResourceKey) {
+    (row.machine, row.machine_header, row.key)
+}
+
+fn machine_status(status: MachineStatus, failure: Option<&super::federation::Failure>) -> String {
+    match status {
+        MachineStatus::Connecting => "Connecting".into(),
+        MachineStatus::Ready => "Online".into(),
+        MachineStatus::Reconnecting => "Reconnecting · stale".into(),
+        MachineStatus::Disabled => "Disabled".into(),
+        MachineStatus::Attention => failure.map_or_else(
+            || "Attention".into(),
+            |failure| format!("Attention · {}", failure.message),
+        ),
+    }
 }
 
 fn render_fuzzy_path(
@@ -920,6 +1083,10 @@ fn flatten_optional(
         rows.push(NavigatorRow {
             key: ResourceKey::Session(session.id),
             session_id: session.id,
+            machine: MachineId::Local,
+            generation: Generation::default(),
+            machine_header: false,
+            selectable: !session.closing,
             depth: 0,
             label: session.name.clone(),
             inline_pane: None,
@@ -947,6 +1114,10 @@ fn flatten_optional(
             rows.push(NavigatorRow {
                 key: ResourceKey::Workspace(workspace.id),
                 session_id: session.id,
+                machine: MachineId::Local,
+                generation: Generation::default(),
+                machine_header: false,
+                selectable: !closing,
                 depth: 1,
                 label: workspace.name.clone(),
                 inline_pane: None,
@@ -983,6 +1154,10 @@ fn flatten_optional(
                 rows.push(NavigatorRow {
                     key: ResourceKey::Tab(tab.id),
                     session_id: session.id,
+                    machine: MachineId::Local,
+                    generation: Generation::default(),
+                    machine_header: false,
+                    selectable: !tab_row_closing,
                     depth: 2,
                     label: tab_label,
                     inline_pane: single_pane.map(|pane| pane.id),
@@ -1004,6 +1179,10 @@ fn flatten_optional(
                     rows.push(NavigatorRow {
                         key: ResourceKey::Pane(pane.id),
                         session_id: session.id,
+                        machine: MachineId::Local,
+                        generation: Generation::default(),
+                        machine_header: false,
+                        selectable: !pane_closing,
                         depth: 3,
                         label: format!("pane {}", index + 1),
                         inline_pane: None,
@@ -1033,11 +1212,75 @@ fn put(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style
 mod tests {
     use super::*;
     use crate::{
+        client::federation::{EndpointSpec, Generation, State as FederationState, Status},
         domain::TerminalId,
+        machines::Machine,
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
     };
+
+    #[test]
+    fn federated_rows_are_qualified_and_stale_machines_cannot_be_selected() {
+        let (snapshot, current, _) = fixture();
+        let remote_id = Uuid::new_v4();
+        let generation = Generation {
+            supervisor: 7,
+            connection: 9,
+        };
+        let state = FederationState::fixture(vec![
+            (
+                EndpointSpec::Local,
+                Status::Ready,
+                generation,
+                Some(snapshot.clone()),
+            ),
+            (
+                EndpointSpec::Ssh(Machine {
+                    id: remote_id,
+                    label: "work".into(),
+                    target: "work.example".into(),
+                    enabled: true,
+                }),
+                Status::Reconnecting,
+                generation,
+                Some(snapshot),
+            ),
+        ]);
+        let mut navigator = NavigatorState::open();
+        assert!(navigator.accept_federation(
+            &state,
+            MachineId::Local,
+            &current,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        ));
+        assert!(navigator.rows.iter().any(|row| {
+            row.machine == MachineId::Ssh(remote_id)
+                && row.machine_header
+                && row.label.contains("Reconnecting")
+        }));
+        assert!(
+            navigator
+                .rows
+                .iter()
+                .filter(|row| row.machine == MachineId::Ssh(remote_id))
+                .all(|row| !row.selectable && row.destination.is_none())
+        );
+
+        navigator.selected = navigator
+            .rows
+            .iter()
+            .position(|row| row.machine == MachineId::Ssh(remote_id))
+            .unwrap();
+        assert!(matches!(
+            navigator.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 4),
+            NavigatorAction::Stay
+        ));
+        for (width, height) in [(1, 1), (8, 3), (16, 4)] {
+            let _ = rendered(&mut navigator, width, height);
+        }
+    }
     use std::path::PathBuf;
 
     fn fixture() -> (ResourceSnapshot, SelectedTarget, PaneId) {
@@ -1213,7 +1456,7 @@ mod tests {
         assert_eq!(nav.selected, 0);
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
-            NavigatorAction::Select(TargetSelector::Pane(pane_id)) if pane_id == current.pane_id
+            NavigatorAction::Select(NavigatorSelection { selector: TargetSelector::Pane(pane_id), .. }) if pane_id == current.pane_id
         ));
     }
 
@@ -1597,6 +1840,10 @@ mod tests {
         let row = |depth: u16| NavigatorRow {
             key: ResourceKey::Pane(PaneId::new()),
             session_id: SessionId::new(),
+            machine: MachineId::Local,
+            generation: Generation::default(),
+            machine_header: false,
+            selectable: true,
             depth,
             label: String::new(),
             inline_pane: None,
@@ -1765,7 +2012,7 @@ mod tests {
         assert_eq!(nav.selected, 4);
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
-            NavigatorAction::Select(TargetSelector::Pane(pane)) if pane == other_pane
+            NavigatorAction::Select(NavigatorSelection { selector: TargetSelector::Pane(pane), .. }) if pane == other_pane
         ));
     }
 
