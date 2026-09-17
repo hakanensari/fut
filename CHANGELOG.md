@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added configurable direct hotkeys for running actions without the command prefix.
 - Remote attachments now work across compatible Fut versions and adapt to the remote daemon's supported features.
 - Local interfaces now supervise enabled saved machines independently in the background, retaining stale metadata across transient reconnects without streaming terminal screens.
 - Added `fut --remote HOST` for using the local interface and clipboard with an existing Fut daemon over SSH.

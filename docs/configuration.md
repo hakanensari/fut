@@ -126,6 +126,12 @@ open_command_bar = "space"
 # focus_last_session = "ctrl-s"
 # close_pane = "x"
 
+[ui.hotkeys]
+# These run immediately, without the prefix.
+# "ctrl-t" = "open_tab_bar"
+# "ctrl-f" = "open_navigator"
+# "ctrl-r" = "run:restart"
+
 [trusted_commands.git_diff]
 title = "Repository diff"
 binding = "g"
@@ -272,17 +278,21 @@ discovery.
 Set `ui.prefix` to change the default `ctrl-b` prefix. Bindings are unique
 suffixes after it. Set a built-in action or quoted extension command slug under
 `[ui.bindings]`; see the [complete defaults table](usage.md#everyday-controls)
-for action names.
+for action names. To run an action immediately without entering the prefix,
+map the key to the action under `[ui.hotkeys]` instead. Direct hotkeys are
+additional: the action's prefixed binding continues to work.
 
 The command palette also includes `rename-session`, `rename-workspace`,
 `rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab`. They have no
 default bindings; configure the corresponding `rename_*` or `close_*` keys to
 add shortcuts. `kill-pane` remains bound through `close_pane` by default.
 
-A prefix or suffix may be one printable character, `ctrl-a` through `ctrl-z`,
-`space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes also accept `prefix`,
-meaning the configured prefix key again. Pause after the prefix to see the
-effective bindings, or press prefix then `:` to search the command palette.
+A prefix, suffix, or hotkey may be one printable character, `ctrl-a` through
+`ctrl-z`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes also accept
+`prefix`, meaning the configured prefix key again. A hotkey cannot be the
+configured prefix or share a key with another hotkey. Pause after the prefix to
+see the effective bindings, or press prefix then `:` to search the command
+palette.
 
 An `[extension_commands."EXTENSION:COMMAND"]` table can set `args` to replace
 the arguments supplied after that extension command's manifest executable.
@@ -291,7 +301,7 @@ passes no arguments, and unknown qualified command slugs are rejected.
 
 ## Trusted commands
 
-Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, string array `args`, `size`, and `activate_opened` values. `program` supports `~` and `~/` home-directory expansion. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
+Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, `hotkey`, string array `args`, `size`, and `activate_opened` values. `binding` follows the prefix; `hotkey` runs the command directly. `program` supports `~` and `~/` home-directory expansion. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding and hotkey collisions and duplicate command keys are rejected. Commands appear in the command palette; prefixed command bindings also appear in delayed which-key help. Configuration reload replaces them atomically.
 
 ## Sidebars
 

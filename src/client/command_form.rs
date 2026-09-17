@@ -392,6 +392,7 @@ mod tests {
             PaletteCommand {
                 title: "Create something".into(),
                 binding: None,
+                hotkey: None,
                 program: "/bin/true".into(),
                 args: Vec::new(),
                 execution: ExtensionCommandExecution::Interactive {

@@ -145,6 +145,8 @@ pub(super) enum SemanticStyle {
 pub(super) struct BindingsConfig {
     values: BTreeMap<String, String>,
     #[serde(skip)]
+    hotkeys: BTreeMap<String, String>,
+    #[serde(skip)]
     commands: Vec<PaletteCommand>,
     #[serde(skip, default = "default_prefix")]
     prefix: Vec<u8>,
@@ -158,6 +160,7 @@ impl Default for BindingsConfig {
     fn default() -> Self {
         Self {
             values: BTreeMap::new(),
+            hotkeys: BTreeMap::new(),
             commands: Vec::new(),
             prefix: default_prefix(),
         }
@@ -168,6 +171,7 @@ impl Default for BindingsConfig {
 pub(super) struct PaletteCommand {
     pub title: String,
     pub binding: Option<String>,
+    pub hotkey: Option<String>,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub execution: ExtensionCommandExecution,
@@ -181,6 +185,8 @@ struct PaletteCommandDto {
     title: String,
     #[serde(default)]
     binding: Option<String>,
+    #[serde(default)]
+    hotkey: Option<String>,
     program: PathBuf,
     #[serde(default)]
     args: Vec<String>,
@@ -241,6 +247,7 @@ impl<'de> Deserialize<'de> for PaletteCommand {
         Ok(Self {
             title: dto.title,
             binding: dto.binding,
+            hotkey: dto.hotkey,
             program: dto.program,
             args: dto.args,
             execution,
@@ -260,6 +267,10 @@ impl BindingsConfig {
 
     fn set_prefix(&mut self, prefix: Vec<u8>) {
         self.prefix = prefix;
+    }
+
+    fn set_hotkeys(&mut self, hotkeys: BTreeMap<String, String>) {
+        self.hotkeys = hotkeys;
     }
 
     pub(super) fn prefix(&self) -> &[u8] {
@@ -325,11 +336,28 @@ impl BindingsConfig {
         )
     }
 
+    fn hotkey_for_target(&self, target: &str) -> Option<(Vec<u8>, String)> {
+        self.hotkeys
+            .iter()
+            .find(|(_, action)| action.as_str() == target)
+            .and_then(|(hotkey, _)| parse_key(hotkey))
+    }
+
     pub(super) fn label(&self, action: ClientAction) -> String {
         if let ClientAction::RunCommand(index) = action {
             return self.commands.get(index).map_or_else(
                 || "Unbound".into(),
                 |command| {
+                    if let Some(hotkey) = &command.hotkey {
+                        return parse_key(hotkey).expect("commands are validated").1;
+                    }
+                    if let Some(label) = command
+                        .slug()
+                        .and_then(|slug| self.hotkey_for_target(&slug))
+                        .map(|(_, label)| label)
+                    {
+                        return label;
+                    }
                     command
                         .binding
                         .as_ref()
@@ -344,6 +372,9 @@ impl BindingsConfig {
                         })
                 },
             );
+        }
+        if let Some((_, label)) = self.hotkey_for_target(config_key(action)) {
+            return label;
         }
         if self.commands.iter().any(|command| {
             command.binding.as_ref().is_some_and(|binding| {
@@ -371,6 +402,32 @@ impl BindingsConfig {
         ALL_ACTIONS.into_iter().find(|action| {
             self.suffix(*action).as_deref() == Some(suffix) && self.label(*action) != "Unbound"
         })
+    }
+
+    pub(super) fn action_for_hotkey(&self, hotkey: &[u8]) -> Option<ClientAction> {
+        if let Some(index) = self.commands.iter().position(|command| {
+            command
+                .hotkey
+                .as_ref()
+                .is_some_and(|binding| parse_key(binding).is_some_and(|(bytes, _)| bytes == hotkey))
+        }) {
+            return Some(ClientAction::RunCommand(index));
+        }
+        let target = self.hotkeys.iter().find_map(|(binding, target)| {
+            parse_key(binding)
+                .is_some_and(|(bytes, _)| bytes == hotkey)
+                .then_some(target)
+        })?;
+        if let Some(action) = ALL_ACTIONS
+            .into_iter()
+            .find(|action| config_key(*action) == target)
+        {
+            return Some(action);
+        }
+        self.commands
+            .iter()
+            .position(|command| command.slug().as_deref() == Some(target))
+            .map(ClientAction::RunCommand)
     }
 
     pub(super) fn commands(&self) -> impl Iterator<Item = (usize, &PaletteCommand)> {
@@ -1424,6 +1481,7 @@ pub(crate) struct UiConfig {
     pub(super) confirm_close: bool,
     prefix: String,
     pub(super) bindings: BindingsConfig,
+    hotkeys: BTreeMap<String, String>,
     pub(super) icons: IconsConfig,
     pub(super) spinner: SpinnerConfig,
     pub(super) styles: StylesConfig,
@@ -1446,6 +1504,7 @@ impl Default for UiConfig {
             confirm_close: true,
             prefix: "ctrl-b".into(),
             bindings: BindingsConfig::default(),
+            hotkeys: BTreeMap::new(),
             icons: IconsConfig::default(),
             spinner: SpinnerConfig::default(),
             styles: StylesConfig::default(),
@@ -2028,6 +2087,10 @@ fn materialize_config(
         .map(|(bytes, _)| bytes)
         .context("ui.prefix must be one character or a named key such as ctrl-a")?;
     config.ui.bindings.set_prefix(prefix);
+    config
+        .ui
+        .bindings
+        .set_hotkeys(std::mem::take(&mut config.ui.hotkeys));
     let home = env::var_os("HOME").map(PathBuf::from);
     for command in config.trusted_commands.values_mut() {
         command.program =
@@ -2048,6 +2111,7 @@ fn materialize_config(
             config.ui.bindings.commands.push(PaletteCommand {
                 title: launcher.title().to_owned(),
                 binding,
+                hotkey: None,
                 program: PathBuf::from(&argv[0]),
                 args: configured_args.map_or_else(
                     || {
@@ -2561,6 +2625,29 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             bail!("ui.bindings must not assign the same key to multiple actions");
         }
     }
+    let mut bound_hotkeys = HashSet::new();
+    for (key, target) in &ui.bindings.hotkeys {
+        let known_target = valid_binding_keys.contains(target.as_str())
+            || ui
+                .bindings
+                .commands
+                .iter()
+                .any(|command| command.slug().as_deref() == Some(target));
+        if !known_target {
+            bail!("unknown ui.hotkeys action {target:?}");
+        }
+        let Some((hotkey, _)) = parse_key(key) else {
+            bail!(
+                "ui.hotkeys key {key:?} must be one character, ctrl-a through ctrl-z, space, enter, tab, esc, up, or down"
+            );
+        };
+        if hotkey == ui.bindings.prefix {
+            bail!("ui.hotkeys key {key:?} must not be the configured prefix key");
+        }
+        if !bound_hotkeys.insert(hotkey) {
+            bail!("ui.hotkeys must not assign the same key to multiple actions");
+        }
+    }
     let explicitly_bound = ui
         .bindings
         .values
@@ -2588,6 +2675,17 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
                     && ui.bindings.suffix(action).as_deref() == Some(&suffix)
             }) {
                 bail!("a command conflicts with an explicitly configured ui binding");
+            }
+        }
+        if let Some(binding) = &command.hotkey {
+            let Some((hotkey, _)) = parse_key(binding) else {
+                bail!("command hotkeys must be one character or a named key");
+            };
+            if hotkey == ui.bindings.prefix {
+                bail!("command hotkeys must not use the configured prefix key");
+            }
+            if !bound_hotkeys.insert(hotkey) {
+                bail!("commands and ui.hotkeys must not assign the same hotkey twice");
             }
         }
     }
@@ -3380,6 +3478,49 @@ components = [
     }
 
     #[test]
+    fn hotkeys_dispatch_without_the_prefix_and_leave_prefixed_bindings_intact() {
+        use crate::client::input::{PrefixAction, PrefixState};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[ui.hotkeys]
+"ctrl-t" = "open_tab_bar"
+"ctrl-f" = "open_command_bar"
+
+[trusted_commands.test]
+title = "Test"
+hotkey = "ctrl-g"
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(config.bindings.label(ClientAction::OpenTabBar), "Ctrl-t");
+        assert_eq!(config.bindings.label(ClientAction::RunCommand(0)), "Ctrl-g");
+
+        let mut prefix = PrefixState::new(config.bindings);
+        assert_eq!(
+            prefix.feed(vec![20]),
+            PrefixAction::Dispatch(ClientAction::OpenTabBar)
+        );
+        assert_eq!(
+            prefix.feed(vec![7]),
+            PrefixAction::Dispatch(ClientAction::RunCommand(0))
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![20]),
+            PrefixAction::Dispatch(ClientAction::FocusLast(
+                crate::client::actions::HistoryScope::Tab,
+            ))
+        );
+        assert_eq!(prefix.feed(vec![24]), PrefixAction::Send(vec![24]));
+    }
+
+    #[test]
     fn strict_validation_rejects_ambiguous_unsafe_and_out_of_scope_segments() {
         let temporary = tempfile::tempdir().unwrap();
         for source in [
@@ -3401,6 +3542,10 @@ components = [
             "[ui.bindings]\nunknown = 'x'\n",
             "[ui.bindings]\nopen_command_bar = 's'\n",
             "[ui.bindings]\nopen_command_bar = 'ctrl-aa'\n",
+            "[ui.hotkeys]\n'ctrl-f' = 'unknown'\n",
+            "[ui.hotkeys]\nprefix = 'open_command_bar'\n",
+            "[ui.hotkeys]\n'ctrl-b' = 'open_command_bar'\n",
+            "[ui.hotkeys]\n'ctrl-i' = 'open_command_bar'\ntab = 'open_tab_bar'\n",
             "[ui]\nprefix = 'prefix'\n",
             "[ui.icons]\nvertical_divider = '||'\n",
             "[ui.styles.normal]\nforeground = '#aéabc'\n",

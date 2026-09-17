@@ -177,6 +177,8 @@ impl PrefixState {
             if bytes == self.bindings.prefix() {
                 self.waiting = true;
                 PrefixAction::Wait
+            } else if let Some(action) = self.bindings.action_for_hotkey(&bytes) {
+                PrefixAction::Dispatch(action)
             } else {
                 PrefixAction::Send(bytes)
             }

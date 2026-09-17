@@ -66,8 +66,11 @@ pub(super) fn render(bindings: &BindingsConfig, host: Rect, buffer: &mut Buffer)
 fn entries(bindings: &BindingsConfig) -> Vec<(String, String)> {
     let mut entries = ALL_ACTIONS
         .into_iter()
-        .filter(|action| bindings.label(*action) != "Unbound")
-        .map(|action| (bindings.suffix_label(action), title(action).to_owned()))
+        .filter_map(|action| {
+            let suffix = bindings.suffix(action)?;
+            (bindings.action_for_suffix(&suffix) == Some(action))
+                .then(|| (bindings.suffix_label(action), title(action).to_owned()))
+        })
         .collect::<Vec<_>>();
     entries.extend(bindings.commands().filter_map(|(_, command)| {
         command.binding.as_ref().map(|binding| {

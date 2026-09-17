@@ -145,7 +145,8 @@ workspaces.
 ## Everyday controls
 
 These default bindings follow the `Ctrl-b` prefix, configurable as `ui.prefix`.
-The configuration name is the key to override under `[ui.bindings]`.
+The configuration name is the key to override under `[ui.bindings]`, or to
+assign directly without a prefix under `[ui.hotkeys]`.
 
 | Key | Action | Configuration name |
 | --- | --- | --- |

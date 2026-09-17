@@ -1137,6 +1137,7 @@ mod tests {
         PaletteCommand {
             title: "Test command".into(),
             binding: Some("x".into()),
+            hotkey: None,
             program: program.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
             execution: crate::extensions::ExtensionCommandExecution::Interactive {
