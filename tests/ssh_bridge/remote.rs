@@ -244,13 +244,7 @@ printf 'REMOTE_EXIT:%s\n' "$code"
     let mut client = PtyChild::spawn(command);
     client.wait_success().await;
     // Wait for the asynchronous reader to drain the final pipe bytes.
-    time::timeout(DEADLINE, async {
-        while !client.text().contains("REMOTE_EXIT:1") {
-            time::sleep(POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for(DEADLINE, || client.text().contains("REMOTE_EXIT:1")).await;
     assert!(
         client.text().contains("TERM_UNCHANGED"),
         "{}",

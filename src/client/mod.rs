@@ -427,14 +427,7 @@ pub async fn attach_navigator(
     );
     let ui = staged.materialize(&catalog)?;
     let (snapshot, presence) =
-        match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
-            .await
-            .context("daemon resource snapshot timed out")??
-        {
-            ServerMessage::Resources { snapshot, presence } => (snapshot, presence),
-            ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
-            message => bail!("expected resources from daemon, received {message:?}"),
-        };
+        receive_initial_resources(&mut navigator_connection, "daemon").await?;
 
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -509,17 +502,7 @@ async fn attach_remote_inner(
             let ui = remote::materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
             let mut connection = remote.framed;
             let (snapshot, presence) =
-                match time::timeout(Duration::from_secs(2), receive(&mut connection))
-                    .await
-                    .context("remote resource snapshot timed out")??
-                {
-                    ServerMessage::Resources { snapshot, presence } => (snapshot, presence),
-                    ServerMessage::Error { code, message } => {
-                        bail!("remote daemon error ({code}): {message}")
-                    }
-                    ServerMessage::EndpointError { error } => return Err(error.into()),
-                    _ => bail!("expected resources from remote daemon"),
-                };
+                receive_initial_resources(&mut connection, "remote daemon").await?;
             Ok((connection, ui, snapshot, presence, remote.capabilities))
         })
         .await?;
@@ -1007,6 +990,23 @@ async fn initial_navigator(
                 }
             }
         }
+    }
+}
+
+async fn receive_initial_resources(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    endpoint: &str,
+) -> anyhow::Result<(ResourceSnapshot, crate::protocol::ClientPresenceSnapshot)> {
+    match time::timeout(Duration::from_secs(2), receive(framed))
+        .await
+        .with_context(|| format!("{endpoint} resource snapshot timed out"))??
+    {
+        ServerMessage::Resources { snapshot, presence } => Ok((snapshot, presence)),
+        ServerMessage::Error { code, message } => {
+            bail!("{endpoint} error ({code}): {message}")
+        }
+        ServerMessage::EndpointError { error } => Err(error.into()),
+        message => bail!("expected resources from {endpoint}, received {message:?}"),
     }
 }
 
