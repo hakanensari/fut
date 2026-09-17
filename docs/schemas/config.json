@@ -1,0 +1,482 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "id": "https://fut.sh/schemas/config.json",
+  "title": "Fut configuration",
+  "description": "Global Fut client, terminal, project, command, and extension configuration.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "terminal": { "$ref": "#/definitions/terminal" },
+    "alerts": { "$ref": "#/definitions/alerts" },
+    "ui": { "$ref": "#/definitions/ui" },
+    "extensions": {
+      "type": "array",
+      "description": "Trusted local extension package directories.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "extension": {
+      "type": "object",
+      "description": "Global extension configuration keyed by installed extension ID.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": { "$ref": "#/definitions/tomlValue" }
+      }
+    },
+    "extension_commands": {
+      "type": "object",
+      "description": "Argument overrides keyed by extension command slug.",
+      "additionalProperties": { "$ref": "#/definitions/extensionCommand" }
+    },
+    "trusted_commands": {
+      "type": "object",
+      "description": "Executable commands available from the command palette.",
+      "additionalProperties": { "$ref": "#/definitions/trustedCommand" }
+    },
+    "projects_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Fallback parent directory for project names not explicitly catalogued."
+    },
+    "projects": {
+      "type": "object",
+      "description": "Project catalog keyed by project name.",
+      "patternProperties": {
+        "^[A-Za-z0-9_-]{1,64}$": { "$ref": "#/definitions/project" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "definitions": {
+    "key": {
+      "type": "string",
+      "pattern": "^(ctrl-[a-z]|space|enter|tab|escape|esc|up|down|.)$",
+      "description": "One printable character or a named key such as ctrl-a, space, enter, tab, esc, up, or down."
+    },
+    "suffix": {
+      "type": "string",
+      "pattern": "^(prefix|ctrl-[a-z]|space|enter|tab|escape|esc|up|down|.)$",
+      "description": "A key following the configured prefix. The value prefix means the prefix key itself."
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "open_command_bar",
+        "open_messages",
+        "open_project",
+        "reload_config",
+        "reload_project_config",
+        "enter_copy_mode",
+        "open_navigator",
+        "open_agents",
+        "open_left_sidebar",
+        "open_right_sidebar",
+        "open_tab_bar",
+        "open_notifications",
+        "focus_next_notification",
+        "create_workspace",
+        "create_tab",
+        "rename_session",
+        "rename_workspace",
+        "rename_tab",
+        "focus_next_tab",
+        "focus_previous_tab",
+        "focus_next_workspace",
+        "focus_previous_workspace",
+        "split_pane_right",
+        "split_pane_down",
+        "focus_next_pane",
+        "focus_previous_pane",
+        "focus_pane_left",
+        "focus_pane_down",
+        "focus_pane_up",
+        "focus_pane_right",
+        "focus_last_pane",
+        "focus_last_tab",
+        "focus_last_workspace",
+        "focus_last_session",
+        "focus_tab_1",
+        "focus_tab_2",
+        "focus_tab_3",
+        "focus_tab_4",
+        "focus_tab_5",
+        "focus_tab_6",
+        "focus_tab_7",
+        "focus_tab_8",
+        "focus_tab_9",
+        "focus_tab_10",
+        "toggle_pane_zoom",
+        "close_session",
+        "close_workspace",
+        "close_tab",
+        "close_pane",
+        "detach"
+      ]
+    },
+    "actionTarget": {
+      "anyOf": [
+        { "$ref": "#/definitions/action" },
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$",
+          "description": "An installed extension command slug."
+        }
+      ]
+    },
+    "bindings": {
+      "type": "object",
+      "description": "Prefix suffixes keyed by built-in action or extension command slug.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$": { "$ref": "#/definitions/suffix" }
+      },
+      "properties": {
+        "open_command_bar": { "$ref": "#/definitions/suffix" },
+        "open_messages": { "$ref": "#/definitions/suffix" },
+        "open_project": { "$ref": "#/definitions/suffix" },
+        "reload_config": { "$ref": "#/definitions/suffix" },
+        "reload_project_config": { "$ref": "#/definitions/suffix" },
+        "enter_copy_mode": { "$ref": "#/definitions/suffix" },
+        "open_navigator": { "$ref": "#/definitions/suffix" },
+        "open_agents": { "$ref": "#/definitions/suffix" },
+        "open_left_sidebar": { "$ref": "#/definitions/suffix" },
+        "open_right_sidebar": { "$ref": "#/definitions/suffix" },
+        "open_tab_bar": { "$ref": "#/definitions/suffix" },
+        "open_notifications": { "$ref": "#/definitions/suffix" },
+        "focus_next_notification": { "$ref": "#/definitions/suffix" },
+        "create_workspace": { "$ref": "#/definitions/suffix" },
+        "create_tab": { "$ref": "#/definitions/suffix" },
+        "rename_session": { "$ref": "#/definitions/suffix" },
+        "rename_workspace": { "$ref": "#/definitions/suffix" },
+        "rename_tab": { "$ref": "#/definitions/suffix" },
+        "focus_next_tab": { "$ref": "#/definitions/suffix" },
+        "focus_previous_tab": { "$ref": "#/definitions/suffix" },
+        "focus_next_workspace": { "$ref": "#/definitions/suffix" },
+        "focus_previous_workspace": { "$ref": "#/definitions/suffix" },
+        "split_pane_right": { "$ref": "#/definitions/suffix" },
+        "split_pane_down": { "$ref": "#/definitions/suffix" },
+        "focus_next_pane": { "$ref": "#/definitions/suffix" },
+        "focus_previous_pane": { "$ref": "#/definitions/suffix" },
+        "focus_pane_left": { "$ref": "#/definitions/suffix" },
+        "focus_pane_down": { "$ref": "#/definitions/suffix" },
+        "focus_pane_up": { "$ref": "#/definitions/suffix" },
+        "focus_pane_right": { "$ref": "#/definitions/suffix" },
+        "focus_last_pane": { "$ref": "#/definitions/suffix" },
+        "focus_last_tab": { "$ref": "#/definitions/suffix" },
+        "focus_last_workspace": { "$ref": "#/definitions/suffix" },
+        "focus_last_session": { "$ref": "#/definitions/suffix" },
+        "focus_tab_1": { "$ref": "#/definitions/suffix" },
+        "focus_tab_2": { "$ref": "#/definitions/suffix" },
+        "focus_tab_3": { "$ref": "#/definitions/suffix" },
+        "focus_tab_4": { "$ref": "#/definitions/suffix" },
+        "focus_tab_5": { "$ref": "#/definitions/suffix" },
+        "focus_tab_6": { "$ref": "#/definitions/suffix" },
+        "focus_tab_7": { "$ref": "#/definitions/suffix" },
+        "focus_tab_8": { "$ref": "#/definitions/suffix" },
+        "focus_tab_9": { "$ref": "#/definitions/suffix" },
+        "focus_tab_10": { "$ref": "#/definitions/suffix" },
+        "toggle_pane_zoom": { "$ref": "#/definitions/suffix" },
+        "close_session": { "$ref": "#/definitions/suffix" },
+        "close_workspace": { "$ref": "#/definitions/suffix" },
+        "close_tab": { "$ref": "#/definitions/suffix" },
+        "close_pane": { "$ref": "#/definitions/suffix" },
+        "detach": { "$ref": "#/definitions/suffix" }
+      }
+    },
+    "hotkeys": {
+      "type": "object",
+      "description": "Direct keys mapped to built-in actions or extension command slugs.",
+      "patternProperties": {
+        "^(ctrl-[a-z]|space|enter|tab|escape|esc|up|down|.)$": { "$ref": "#/definitions/actionTarget" }
+      },
+      "additionalProperties": false
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scrollback_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 104857600,
+          "description": "Maximum retained scrollback storage per terminal in bytes."
+        }
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "signal_outer_terminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Emit one BEL when a newly unseen terminal bell arrives."
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pane_layout": { "enum": ["splits", "accordion"], "default": "splits" },
+        "confirm_close": { "type": "boolean", "default": true },
+        "prefix": { "$ref": "#/definitions/key" },
+        "bindings": { "$ref": "#/definitions/bindings" },
+        "hotkeys": { "$ref": "#/definitions/hotkeys" },
+        "icons": { "$ref": "#/definitions/icons" },
+        "spinner": { "$ref": "#/definitions/spinner" },
+        "styles": { "$ref": "#/definitions/styles" },
+        "tab_bar": { "$ref": "#/definitions/tabBar" },
+        "sidebar": { "$ref": "#/definitions/sidebar" }
+      }
+    },
+    "icons": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preset": { "enum": ["ascii", "unicode", "nerd_font"], "default": "unicode" },
+        "current": { "type": "string" },
+        "closing": { "type": "string" },
+        "overflow": { "type": "string" },
+        "workspace": { "type": "string" },
+        "tab": { "type": "string" },
+        "zoom": { "type": "string" },
+        "notification": { "type": "string" },
+        "vertical_divider": { "type": "string" },
+        "pill_left": { "type": "string" },
+        "pill_right": { "type": "string" }
+      }
+    },
+    "spinner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "style": { "type": "string", "default": "dots" },
+        "frames": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "interval": { "type": "integer", "minimum": 16, "maximum": 2000 }
+      }
+    },
+    "semanticStyle": {
+      "enum": ["normal", "muted", "session", "workspace", "tab", "pane", "current", "selected", "closing", "activity", "attention", "error", "divider", "added", "deleted"]
+    },
+    "color": {
+      "type": "string",
+      "pattern": "^(default|black|red|green|yellow|blue|magenta|cyan|gray|dark_gray|light_red|light_green|light_yellow|light_blue|light_magenta|light_cyan|white|index:(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})|#[0-9A-Fa-f]{6})$"
+    },
+    "modifier": {
+      "enum": ["bold", "dim", "italic", "underlined", "reversed", "crossed_out"]
+    },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "foreground": { "$ref": "#/definitions/color" },
+        "background": { "$ref": "#/definitions/color" },
+        "add_modifiers": { "type": "array", "items": { "$ref": "#/definitions/modifier" } },
+        "remove_modifiers": { "type": "array", "items": { "$ref": "#/definitions/modifier" } }
+      }
+    },
+    "styles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "normal": { "$ref": "#/definitions/style" },
+        "muted": { "$ref": "#/definitions/style" },
+        "session": { "$ref": "#/definitions/style" },
+        "workspace": { "$ref": "#/definitions/style" },
+        "tab": { "$ref": "#/definitions/style" },
+        "pane": { "$ref": "#/definitions/style" },
+        "current": { "$ref": "#/definitions/style" },
+        "selected": { "$ref": "#/definitions/style" },
+        "closing": { "$ref": "#/definitions/style" },
+        "activity": { "$ref": "#/definitions/style" },
+        "attention": { "$ref": "#/definitions/style" },
+        "error": { "$ref": "#/definitions/style" },
+        "divider": { "$ref": "#/definitions/style" },
+        "added": { "$ref": "#/definitions/style" },
+        "deleted": { "$ref": "#/definitions/style" }
+      }
+    },
+    "textSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": "string" },
+        "style": { "$ref": "#/definitions/semanticStyle" }
+      },
+      "required": ["text"]
+    },
+    "tokenSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "token": { "type": "string", "minLength": 1 },
+        "style": { "$ref": "#/definitions/semanticStyle" },
+        "prefix": { "type": "string" },
+        "suffix": { "type": "string" },
+        "max_width": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "inverted": { "type": "boolean", "default": false },
+        "pill": { "type": "boolean", "default": false }
+      },
+      "required": ["token"]
+    },
+    "tabsSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "component": { "enum": ["tabs"] }
+      },
+      "required": ["component"]
+    },
+    "segment": {
+      "oneOf": [
+        { "$ref": "#/definitions/textSegment" },
+        { "$ref": "#/definitions/tokenSegment" },
+        { "$ref": "#/definitions/tabsSegment" }
+      ]
+    },
+    "segments": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/definitions/segment" }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "segments": { "$ref": "#/definitions/segments" },
+        "style": { "$ref": "#/definitions/semanticStyle" },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 255, "default": 100 }
+      }
+    },
+    "tabBar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "position": { "enum": ["top", "bottom"], "default": "top" },
+        "left": { "type": "array", "maxItems": 64, "items": { "$ref": "#/definitions/group" } },
+        "center": { "type": "array", "maxItems": 64, "items": { "$ref": "#/definitions/group" } },
+        "right": { "type": "array", "maxItems": 64, "items": { "$ref": "#/definitions/group" } },
+        "item": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "segments": { "$ref": "#/definitions/segments" } }
+        }
+      }
+    },
+    "componentSize": {
+      "oneOf": [
+        { "enum": ["fill"] },
+        { "type": "integer", "minimum": 1, "maximum": 65535 }
+      ]
+    },
+    "workspaceRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": { "$ref": "#/definitions/segments" },
+        "body": { "$ref": "#/definitions/segments" },
+        "right": { "$ref": "#/definitions/segments" },
+        "detail": { "$ref": "#/definitions/segments" }
+      }
+    },
+    "workspaceComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "component": { "enum": ["workspaces"] },
+        "size": { "$ref": "#/definitions/componentSize" },
+        "header": { "$ref": "#/definitions/segments" },
+        "footer": { "$ref": "#/definitions/segments" },
+        "row": { "$ref": "#/definitions/workspaceRow" }
+      },
+      "required": ["component"]
+    },
+    "agentsComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "component": { "enum": ["agents"] },
+        "size": { "$ref": "#/definitions/componentSize" },
+        "scope": { "enum": ["tab", "workspace", "session", "global"], "default": "session" }
+      },
+      "required": ["component"]
+    },
+    "sidebarSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width": { "type": "integer", "minimum": 4, "maximum": 80, "default": 28 },
+        "display": { "enum": ["expanded", "minimized"], "default": "expanded" },
+        "visibility": { "enum": ["visible", "automatic", "hidden"], "default": "automatic" },
+        "components": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/definitions/workspaceComponent" },
+              { "$ref": "#/definitions/agentsComponent" }
+            ]
+          }
+        }
+      }
+    },
+    "sidebar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": { "$ref": "#/definitions/sidebarSlot" },
+        "right": { "$ref": "#/definitions/sidebarSlot" }
+      }
+    },
+    "popupSize": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width": { "type": "integer", "minimum": 4, "maximum": 65535 },
+        "height": { "type": "integer", "minimum": 3, "maximum": 65535 }
+      }
+    },
+    "trustedCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/definitions/suffix" },
+        "hotkey": { "$ref": "#/definitions/key" },
+        "program": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "size": { "$ref": "#/definitions/popupSize" },
+        "activate_opened": { "type": "boolean", "default": false },
+        "mode": { "enum": ["interactive", "background"], "default": "interactive" }
+      },
+      "required": ["title", "program"]
+    },
+    "extensionCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "args": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "recipe": { "type": "string", "minLength": 1 }
+      },
+      "required": ["path"]
+    },
+    "tomlValue": {
+      "oneOf": [
+        { "type": ["string", "number", "integer", "boolean"] },
+        { "type": "array", "items": { "$ref": "#/definitions/tomlValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/definitions/tomlValue" } }
+      ]
+    }
+  }
+}

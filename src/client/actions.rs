@@ -928,4 +928,29 @@ mod tests {
             "select-pane -L"
         );
     }
+
+    #[test]
+    fn configuration_schema_lists_every_action() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../docs/schemas/config.json")).unwrap();
+        let expected = ALL_ACTIONS
+            .into_iter()
+            .map(config_key)
+            .collect::<HashSet<_>>();
+        let actions = schema["definitions"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<HashSet<_>>();
+        let bindings = schema["definitions"]["bindings"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(actions, expected);
+        assert_eq!(bindings, expected);
+    }
 }

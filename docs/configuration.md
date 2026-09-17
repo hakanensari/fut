@@ -43,6 +43,20 @@ A missing implicit file, including one selected through `--config-dir`, uses def
 
 Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid values, unsafe control or bidirectional-formatting characters, ambiguous segments, and out-of-scope tokens are errors.
 
+## Editor completion
+
+Fut publishes a [JSON Schema](/schemas/config.json) for global configuration.
+Add this Taplo schema directive as the first line of `config.toml` to get
+validation, documentation, and completion in compatible TOML editors:
+
+```toml
+#:schema https://fut.sh/schemas/config.json
+```
+
+The schema offers built-in action completion for `[ui.bindings]` and
+`[ui.hotkeys]`. Installed extension command slugs and extension-owned settings
+remain dynamic and are validated by Fut when it loads the configuration.
+
 Closing a pane, tab, workspace, or session asks for confirmation by default. While the prompt is open, it exclusively owns keyboard, paste, and pointer input; resizing the host terminal remains available. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus. Interactive rename and close actions can change only the session to which that client is attached and resources within it. A tab, workspace, or session close can finish only partway if a later terminal cannot close; Fut reports how many terminals exited and keeps the target marked closing because those exits cannot be undone.
 
 Terminal-native alerts are configured at the top level. They are separate
@@ -85,6 +99,8 @@ This example is intentionally customized; it is not a dump of the defaults.
 Omit any field to keep its default value.
 
 ```toml
+#:schema https://fut.sh/schemas/config.json
+
 extensions = [
   "extensions/review-status",
   "extensions/run",
