@@ -782,7 +782,6 @@ fn spawn_daemon(
         .env("PATH", path)
         .env("TMPDIR", runtime)
         .env("FUT_RUNTIME_DIR", runtime)
-        .env("TERM", "xterm-256color")
         .env("PS1", TEST_SHELL_PROMPT)
         .arg("--socket")
         .arg(socket)
@@ -816,6 +815,21 @@ impl Drop for Harness {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn terminal_uses_portable_term_when_daemon_has_no_term() {
+    let harness = Harness::start(
+        "printf '%s\\n' \"$TERM\" > terminal-type; while IFS= read -r line; do :; done",
+    )
+    .await;
+    let terminal_type = harness.root.path().join("cwd/terminal-type");
+    wait_for(DEADLINE, || terminal_type.exists()).await;
+
+    assert_eq!(
+        fs::read_to_string(terminal_type).unwrap(),
+        "xterm-256color\n"
+    );
 }
 
 #[tokio::test]

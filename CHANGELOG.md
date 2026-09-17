@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed shell redraws, including zsh autosuggestions, by advertising a portable terminal type inside Fut.
+
 ## 0.23
 
 - Added SSH remote attachment and machine federation, including saved profiles, compatible-version negotiation, independent reconnecting metadata watchers, machine-qualified navigation and notifications, and atomic whole-tab switching.

@@ -605,15 +605,15 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let mut command = CommandBuilder::new(&spec.program);
     command.args(&spec.argv);
     command.cwd(&spec.cwd);
-    if !spec.env.contains_key(std::ffi::OsStr::new("TERM")) {
-        command.env("TERM", "xterm-ghostty");
-    }
     if !spec.env.contains_key(std::ffi::OsStr::new("COLORTERM")) {
         command.env("COLORTERM", "truecolor");
     }
     for (key, value) in &spec.env {
         command.env(key, value);
     }
+    // TERM describes Fut's emulated PTY, not the terminal that happened to
+    // launch the daemon. Keep it stable and broadly available on every host.
+    command.env("TERM", "xterm-256color");
 
     // Acquire every fallible PTY resource and start the parser before the child
     // exists. After spawn, the runtime thread becomes the sole child owner.
@@ -1781,15 +1781,16 @@ mod tests {
     async fn passes_explicit_args_env_and_input_then_reports_durable_exit() {
         let mut env = HashMap::new();
         env.insert("FUT_TEST".into(), "works".into());
+        env.insert("TERM".into(), "xterm-ghostty".into());
         let handle = spawn_terminal(shell(
-            "printf '%s:' \"$FUT_TEST\"; IFS= read -r line; printf '%s' \"$line\"",
+            "printf '%s:%s:' \"$FUT_TEST\" \"$TERM\"; IFS= read -r line; printf '%s' \"$line\"",
             env,
         ))
         .unwrap();
         let mut snapshots = handle.subscribe_snapshots();
         let mut lifecycle = handle.subscribe_lifecycle();
         handle.input(b"input\n".to_vec()).await.unwrap();
-        wait_for_text(&mut snapshots, "works:input").await;
+        wait_for_text(&mut snapshots, "works:xterm-256color:input").await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while *lifecycle.borrow_and_update() == TerminalLifecycle::Running {
                 lifecycle.changed().await.unwrap();
